@@ -1,3 +1,14 @@
+#Warning
+
+Vibe coding was used to make modifications to this bot.
+Extensive testing was done to make sure the Voice Channel communication works. Nothing else has been tested.
+I am not a programmer, yet.
+
+# Change Log... thing
+
+(9/25/25) Made fork... thing with added basic memory... thing, Discord nicknames are given to the bot, removed <think> from TTS responses, added basic TTS.py and Whisper.py server files. Planning on updating memory functionality soon.
+
+
 # Discord Voice Chat LLM
 
 This Discord bot uses voice recognition to interact with users in a voice channel through transcription, processing with a Large Language Model (LLM), and responding with synthesized voice. The bot converts spoken audio to text, sends it to an LLM for processing, and uses Text-to-Speech (TTS) to voice the response.
