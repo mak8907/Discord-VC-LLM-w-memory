@@ -12,6 +12,8 @@ const { google } = require('googleapis');
 const { exec } = require('child_process');
 const path = require('path');
 const { log } = require('console');
+const { open } = require('sqlite');
+const sqlite3 = require('sqlite3');
 
 let alarms = [];
 
@@ -26,6 +28,9 @@ const youtube = google.youtube({
   version: 'v3',
   auth: process.env.YOUTUBE_API
 });
+
+// New global variable
+let db = null;
 
 // Call the command registration script
 exec(`node ${path.join(__dirname, 'registerCommands.js')}`, (error, stdout, stderr) => {
@@ -63,8 +68,14 @@ if (!fs.existsSync('./recordings')) {
 if (!fs.existsSync('./sounds')) {
   fs.mkdirSync('./sounds');
 }
+if (!fs.existsSync('./chat_logs')) {
+  fs.mkdirSync('./chat_logs');
+}
 
-client.on('ready', () => {
+client.on('clientReady', async () => {
+  // Initialize database
+  await initializeDatabase();
+  
   // Clean up any old recordings
   fs.readdir('./recordings', (err, files) => {
     if (err) {
@@ -256,6 +267,9 @@ client.on('messageCreate', async message => {
     const response = await sendToLLMInThread(message, threadId);
     const messageParts = splitMessage(response);
 
+    // Save to chat log (now async)
+    await saveChatLog(message.author.id, message.content, response, message.channel);
+
     for (const part of messageParts) {
       try {
         await message.channel.send(part);
@@ -273,6 +287,9 @@ client.on('messageCreate', async message => {
     logToConsole('> Reply to message', 'info', 1);
     const response = await sendTextToLLM(message);
     const messageParts = splitMessage(response);
+
+    // Save to chat log (now async)
+    await saveChatLog(message.author.id, message.content, response, message.channel);
 
     // Send the first part as a reply
     try {
@@ -301,6 +318,9 @@ client.on('messageCreate', async message => {
     // Start a new conversation
     const response = await sendTextToLLM(message);
     const messageParts = splitMessage(response);
+
+    // Save to chat log (now async)
+    await saveChatLog(message.author.id, message.content, response, message.channel);
 
     // Send the first part as a reply
     try {
@@ -340,6 +360,102 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     }
   }
 });
+
+async function initializeDatabase() {
+  try {
+    db = await open({
+      filename: './chat_logs/chat_history.db',
+      driver: sqlite3.Database
+    });
+
+    // Create the chat_logs table if it doesn't exist
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS chat_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        user_message TEXT NOT NULL,
+        ai_response TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        date_only TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_user_id ON chat_logs(user_id);
+      CREATE INDEX IF NOT EXISTS idx_date ON chat_logs(date_only);
+      CREATE INDEX IF NOT EXISTS idx_timestamp ON chat_logs(timestamp);
+    `);
+
+    logToConsole('Database initialized successfully', 'info', 1);
+  } catch (error) {
+    logToConsole(`Error initializing database: ${error.message}`, 'error', 1);
+  }
+}
+
+// Chat logging functions - Add these after your existing variables
+async function saveChatLog(userId, userMessage, aiResponse, channel) {
+  if (!db) {
+    logToConsole('Database not initialized', 'error', 1);
+    return;
+  }
+
+  try {
+    const displayName = getDisplayName(userId, channel);
+    const timestamp = new Date().toISOString();
+    const dateOnly = timestamp.split('T')[0];
+
+    await db.run(`
+      INSERT INTO chat_logs (user_id, display_name, user_message, ai_response, timestamp, date_only)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `, [userId, displayName, userMessage, aiResponse, timestamp, dateOnly]);
+
+    logToConsole(`Chat log saved for user ${userId}`, 'info', 2);
+  } catch (error) {
+    logToConsole(`Error saving chat log: ${error.message}`, 'error', 1);
+  }
+}
+
+async function getRecentChatLogs(userId, days = 7, maxEntries = 50) {
+  if (!db) {
+    logToConsole('Database not initialized', 'error', 1);
+    return [];
+  }
+
+  try {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - days);
+    const cutoffDateString = cutoffDate.toISOString().split('T')[0];
+
+    const logs = await db.all(`
+      SELECT display_name, user_message, ai_response, timestamp
+      FROM chat_logs
+      WHERE user_id = ? AND date_only >= ?
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `, [userId, cutoffDateString, maxEntries]);
+
+    // Reverse to get chronological order (oldest first)
+    return logs.reverse();
+  } catch (error) {
+    logToConsole(`Error retrieving chat logs: ${error.message}`, 'error', 1);
+    return [];
+  }
+}
+
+function formatChatLogsForContext(logs) {
+  if (logs.length === 0) return "No previous chat history found.";
+  
+  let formattedLogs = "Previous conversation history:\n\n";
+  
+  logs.forEach((log, index) => {
+    const date = new Date(log.timestamp).toLocaleDateString();
+    const time = new Date(log.timestamp).toLocaleTimeString();
+    const name = log.display_name || `User ${log.user_id}`;
+    formattedLogs += `[${date} ${time}]\n`;
+    formattedLogs += `${name}: ${log.user_message}\n`;
+    formattedLogs += `Assistant: ${log.ai_response}\n\n`;
+  });
+  
+  return formattedLogs;
+}
 
 function handleRecording(connection, channel) {
   const receiver = connection.receiver;
@@ -635,22 +751,50 @@ async function sendAudioToAPI(fileName, userId, connection, channel) {
   }
 }
 
+function getDisplayName(userId, channel) {
+  const member = channel.guild.members.cache.get(userId);
+  return member?.displayName || member?.user.globalName || member?.user.username || `User ${userId}`;
+}
+
 async function sendToLLM(transcription, userId, connection, channel) {
   let messages = chatHistory[userId] || [];
 
+  // Check if we need to inject context (conversation is short or starting new)
+  const needsContext = messages.length <= 3;
+  let contextInjected = false;
+
   // If this is the first message, add a system prompt
   if (messages.length === 0) {
-    if(allowwithouttrigger){
-      messages.push({
-        role: 'system',
-        content: process.env.LLM_SYSTEM_PROMPT_FREE
-      });
+    let systemPrompt = allowwithouttrigger ? process.env.LLM_SYSTEM_PROMPT_FREE : process.env.LLM_SYSTEM_PROMPT;
+    const displayName = getDisplayName(userId, channel);
+    systemPrompt += `\n\nUser Information: The person you are currently talking to is ${displayName}. When you need to address them by name, use "${displayName}".`;
+    
+    // If we need context, inject it into the system prompt
+    if (needsContext) {
+      const recentLogs = await getRecentChatLogs(userId, 7, 15); // Now async
+      if (recentLogs.length > 0) {
+        const formattedLogs = formatChatLogsForContext(recentLogs);
+        systemPrompt += '\n\n--- Previous Conversation Context ---\n' + formattedLogs + '\n--- End Context ---';
+        contextInjected = true;
+        logToConsole('> Injected context into system prompt', 'info', 2);
+      }
     }
-    else{
+    
+    messages.push({
+      role: 'system',
+      content: systemPrompt
+    });
+  } else if (needsContext && !contextInjected) {
+    // Inject context as a system message if conversation is short but not first message
+    const recentLogs = await getRecentChatLogs(userId, 7, 15); // Now async
+    if (recentLogs.length > 0) {
+      const formattedLogs = formatChatLogsForContext(recentLogs);
       messages.push({
         role: 'system',
-        content: process.env.LLM_SYSTEM_PROMPT
+        content: '--- Relevant Previous Conversation Context ---\n' + formattedLogs + '\n--- End Context ---'
       });
+      contextInjected = true;
+      logToConsole('> Injected context into conversation', 'info', 2);
     }
   }
   
@@ -660,10 +804,11 @@ async function sendToLLM(transcription, userId, connection, channel) {
     content: transcription
   });
 
-  // Keep only the latest X messages
+  // Keep only the latest X messages (but account for potential context injection)
   const messageCount = messages.length;
-  if (messageCount > process.env.MEMORY_SIZE) {
-    messages = messages.slice(messageCount - process.env.MEMORY_SIZE);
+  const maxSize = contextInjected ? process.env.MEMORY_SIZE + 1 : process.env.MEMORY_SIZE;
+  if (messageCount > maxSize) {
+    messages = messages.slice(messageCount - maxSize);
   }
 
   try {
@@ -675,13 +820,13 @@ async function sendToLLM(transcription, userId, connection, channel) {
       }
     });
     
-    // Chat completion without streaming
+    // Single API call - no more double querying
     client.post('/chat/completions', {
       model: process.env.LLM,
       messages: messages,
     })
-    .then((response) => {
-      const llmresponse = response.data.choices[0].message.content;
+    .then(async (response) => {
+      let llmresponse = response.data.choices[0].message.content;
       logToConsole(`> LLM Response: ${llmresponse}`, 'info', 1);
 
       if(llmresponse.includes("IGNORING")){
@@ -699,20 +844,20 @@ async function sendToLLM(transcription, userId, connection, channel) {
       // Update the chat history
       chatHistory[userId] = messages;
 
+      // Save to chat log (now async)
+      await saveChatLog(userId, transcription, llmresponse, channel);
+
       // Update the transcription file if transcribe mode is enabled
       if (transcribemode) {
-        // Check if the transcription file exists, if not create it
         if (!fs.existsSync('./transcription.txt')) {
           fs.writeFileSync('./transcription.txt', '');
         }
-
-        // Append the transcription to the file
         fs.appendFileSync('./transcription.txt', `${userId}: ${transcription}\n\nAssistant: ${llmresponse}\n\n`);
       }
 
       // Send response to TTS service
       playSound(connection, 'result');
-      sendToTTS(llmresponse, userId, connection, channel);
+      sendToTTS(cleanLLMResponse(llmresponse), userId, connection, channel);
     })
     .catch((error) => {
       currentlythinking = false;
@@ -725,15 +870,9 @@ async function sendToLLM(transcription, userId, connection, channel) {
 }
 
 async function sendTextToLLM(message) {
-  // Define the system message
-  const systemMessage = {
-    role: 'system',
-    content: process.env.LLM_TEXT_SYSTEM_PROMPT
-  };
-
   let messages = [];
 
-  // Fetch the message chain
+  // Fetch the message chain first
   let currentMessage = message;
   const messageChain = [];
 
@@ -748,9 +887,9 @@ async function sendTextToLLM(message) {
       } catch (error) {
         if (error.code === 10008) {
           console.error(`Failed to fetch message: ${error.message}`);
-          break; // Exit the loop if the message is not found
+          break;
         } else {
-          throw error; // Re-throw other errors
+          throw error;
         }
       }
     } else {
@@ -758,20 +897,35 @@ async function sendTextToLLM(message) {
     }
   }
 
-  // Reverse the message chain to maintain the correct order
   messageChain.reverse();
-
-  // Add the message chain to the messages array
   messages.push(...messageChain);
+
+  // Check if we need context injection (short conversation chain)
+  const needsContext = messages.length <= 3;
+  let systemPrompt = process.env.LLM_TEXT_SYSTEM_PROMPT;
+
+  if (needsContext) {
+    const recentLogs = await getRecentChatLogs(message.author.id, 7, 15); // Now async
+    if (recentLogs.length > 0) {
+      const formattedLogs = formatChatLogsForContext(recentLogs);
+      systemPrompt += '\n\n--- Previous Conversation Context ---\n' + formattedLogs + '\n--- End Context ---';
+      logToConsole('> Injected context into text conversation', 'info', 2);
+    }
+  }
+
+  // Define the system message with potential context
+  const systemMessage = {
+    role: 'system',
+    content: systemPrompt
+  };
 
   // Keep only the latest X messages, excluding the system message in the count
   const messageCount = messages.length;
   if (messageCount >= process.env.MEMORY_SIZE) {
-    // Slice the messages to keep only the latest X, considering the system message will be added
     messages = messages.slice(-(process.env.MEMORY_SIZE - 1));
   }
 
-  // Add the system message at the beginning of the array
+  // Add the system message at the beginning
   messages.unshift(systemMessage);
 
   try {
@@ -783,14 +937,13 @@ async function sendTextToLLM(message) {
       }
     });
 
-    // Chat completion without streaming
+    // Single API call
     const response = await client.post('/chat/completions', {
       model: process.env.LLM,
       messages: messages,
     });
 
     const llmresponse = response.data.choices[0].message.content;
-
     logToConsole(`> LLM Text Response: ${llmresponse}`, 'info', 1);
 
     return llmresponse;
@@ -805,7 +958,6 @@ async function sendToLLMInThread(message, threadId) {
   if (!threadMemory[threadId]) {
     threadMemory[threadId] = [];
 
-    // Fetch the last 20 messages from the thread
     const threadMessages = await message.channel.messages.fetch({ limit: 20 });
     threadMessages.forEach(threadMessage => {
       threadMemory[threadId].push({
@@ -814,19 +966,10 @@ async function sendToLLMInThread(message, threadId) {
       });
     });
 
-    // Reverse the messages to maintain the correct order
     threadMemory[threadId].reverse();
-
-    // Delete first two messages due to the system message and the message that triggered the thread
     threadMemory[threadId].shift();
     threadMemory[threadId].shift();
   }
-
-  // Define the system message
-  const systemMessage = {
-    role: 'system',
-    content: process.env.LLM_TEXT_SYSTEM_PROMPT
-  };
 
   let messages = threadMemory[threadId];
 
@@ -839,26 +982,40 @@ async function sendToLLMInThread(message, threadId) {
     });
   }
 
-  // Add the message to the messages array
+  // Add the current message
   messages.push({
     role: message.author.id === client.user.id ? 'assistant' : 'user',
     content: message.content
   });
 
-  // Keep only the latest X messages, excluding the system message in the count
+  // Check if we need context injection for threads
+  const needsContext = messages.length <= 3;
+  let systemPrompt = process.env.LLM_TEXT_SYSTEM_PROMPT;
+
+  if (needsContext) {
+    const recentLogs = await getRecentChatLogs(message.author.id, 7, 15); // Now async
+    if (recentLogs.length > 0) {
+      const formattedLogs = formatChatLogsForContext(recentLogs);
+      systemPrompt += '\n\n--- Previous Conversation Context ---\n' + formattedLogs + '\n--- End Context ---';
+      logToConsole('> Injected context into thread conversation', 'info', 2);
+    }
+  }
+
+  // Keep only the latest X messages
   const messageCount = messages.length;
   if (messageCount >= process.env.MEMORY_SIZE) {
-    // Slice the messages to keep only the latest X, considering the system message will be added
     messages = messages.slice(-(process.env.MEMORY_SIZE - 1));
   }
 
-  // Update the thread memory
+  // Update thread memory
   threadMemory[threadId] = messages;
 
-  // Add the system message at the beginning of the array
+  // Add system message
+  const systemMessage = {
+    role: 'system',
+    content: systemPrompt
+  };
   messages.unshift(systemMessage);
-
-  console.log(messages);
 
   try {
     const client = axios.create({
@@ -869,7 +1026,7 @@ async function sendToLLMInThread(message, threadId) {
       }
     });
 
-    // Chat completion without streaming
+    // Single API call
     const response = await client.post('/chat/completions', {
       model: process.env.LLM,
       messages: messages,
@@ -877,14 +1034,13 @@ async function sendToLLMInThread(message, threadId) {
 
     const llmresponse = response.data.choices[0].message.content;
 
-    // Add LLM response to the thread memory
+    // Add LLM response to thread memory
     threadMemory[threadId].push({
       role: 'assistant',
       content: llmresponse
     });
 
-    logToConsole(`> LLM Text Response: ${llmresponse}`, 'info', 1);
-
+    logToConsole(`> LLM Thread Response: ${llmresponse}`, 'info', 1);
     return llmresponse;
   } catch (error) {
     console.error(`Failed to communicate with LLM: ${error.message}`);
@@ -956,9 +1112,12 @@ async function sendToPerplexity(transcription, userId, connection, channel) {
       // Update the chat history
       chatHistory[userId] = messages;
 
+      // Save to chat log for Perplexity responses too
+      saveChatLog(userId, transcription, llmresponse, channel);
+
       // Send response to TTS service
       playSound(connection, 'result');
-      sendToTTS(llmresponse, userId, connection, channel);
+      sendToTTS(cleanLLMResponse(llmresponse), userId, connection, channel);
     })
     .catch((error) => {
       currentlythinking = false;
@@ -1448,6 +1607,20 @@ async function setTimer(query, type = 'alarm', userid, connection, channel) {
     logToConsole('> Timer finished.', 'info', 1);
   }, ms);
   alarms.push({ id: timeoutId, time: formattedTime, type: type });
+}
+
+function cleanLLMResponse(text) {
+  // Remove <think>...</think> tags and their content
+  let cleaned = text.replace(/<think>.*?<\/think>/gs, '');
+  
+  // Remove any other common reasoning tags if needed
+  cleaned = cleaned.replace(/<reasoning>.*?<\/reasoning>/gs, '');
+  cleaned = cleaned.replace(/<analysis>.*?<\/analysis>/gs, '');
+  
+  // Clean up extra whitespace and newlines
+  cleaned = cleaned.replace(/\s+/g, ' ').trim();
+  
+  return cleaned;
 }
 
 function cancelTimer(alarmIndex, userid, connection, channel) {
