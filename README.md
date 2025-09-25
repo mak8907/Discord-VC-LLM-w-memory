@@ -1,6 +1,6 @@
 # Warning
 
-Vibe coding was used to make modifications to this bot.
+AI was used to make modifications to this bot.
 Extensive testing was done to make sure the Voice Channel communication works. Nothing else has been tested.
 I am not a programmer, yet.
 
