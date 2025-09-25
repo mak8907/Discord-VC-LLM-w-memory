@@ -4,7 +4,7 @@
   "description": "A discord bot for voice chat using LLM",
   "main": "bot.js",
   "keywords": [],
-  "author": "Eidenz", 
+  "author": "Eidenz",
   "license": "MIT",
   "dependencies": {
     "@discordjs/voice": "^0.16.1",
