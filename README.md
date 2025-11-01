@@ -6,7 +6,7 @@ I am not a programmer, yet.
 
 # Change Log... thing
 
--(9/25/25) Made fork... thing with added basic memory using SQLite database, Discord nicknames are given to the bot, removed < think > from TTS responses, added basic TTS.py and Whisper.py server files. Planning on updating how the memory functions soon.
+- (9/25/25) Made fork... thing with added basic memory using SQLite database, Discord nicknames are given to the bot, removed < think > from TTS responses, added basic TTS.py and Whisper.py server files. Planning on updating how the memory functions soon.
 - 2.0 done
 
 # Discord Voice Chat LLM
