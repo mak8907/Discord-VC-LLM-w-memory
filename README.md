@@ -1,13 +1,14 @@
 # Warning
 
-AI was used to make modifications to this bot.
-Some testing was done to make sure the Voice Channel communication works. Nothing else has been tested.
-I am not a programmer, yet.
+- AI was used to make modifications to this bot.
+- Some testing was done to make sure the Voice Channel communication works. Nothing else has been tested.
+- I am not a programmer, yet.
 
 # Change Log... thing
 
+- (11/1/25) Voice chat only, added tools, better multi user conversing, optimized memory system and chat logs, saves system prompt for debugging.
 - (9/25/25) Made fork... thing with added basic memory using SQLite database, Discord nicknames are given to the bot, removed < think > from TTS responses, added basic TTS.py and Whisper.py server files. Planning on updating how the memory functions soon.
-- 2.0 done
+
 
 # Discord Voice Chat LLM
 
