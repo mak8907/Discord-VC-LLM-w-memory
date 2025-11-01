@@ -1,36 +1,32 @@
 require('dotenv').config();
 
-const { Client, GatewayIntentBits, Intents } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, EndBehaviorType } = require('@discordjs/voice');
+const { Client, GatewayIntentBits } = require('discord.js');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, EndBehaviorType } = require('@discordjs/voice');
 const fs = require('fs');
 const axios = require('axios');
 const FormData = require('form-data');
 const ffmpeg = require('fluent-ffmpeg');
 const prism = require('prism-media');
-const ytdl = require('ytdl-core');
-const { google } = require('googleapis');
 const { exec } = require('child_process');
 const path = require('path');
-const { log } = require('console');
 const { open } = require('sqlite');
 const sqlite3 = require('sqlite3');
 
-let alarms = [];
-
 let connection = null;
-let alarmongoing = false;
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
-});
-
-const youtube = google.youtube({
-  version: 'v3',
-  auth: process.env.YOUTUBE_API
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ]
 });
 
 // New global variable
 let db = null;
+let memoryKeywords = new Set(); // Store all memory keywords for quick lookup
+let currentSessionId = null;
 
 // Call the command registration script
 exec(`node ${path.join(__dirname, 'registerCommands.js')}`, (error, stdout, stderr) => {
@@ -52,14 +48,27 @@ if (!Array.isArray(botnames)) {
   process.exit(1);
 }
 logToConsole(`Bot triggers: ${botnames}`, 'info', 1);
+
 let chatHistory = {};
-let threadMemory = {};
-
 let transcribemode = false;
-
 let allowwithouttrigger = false;
-let allowwithoutbip = false;
 let currentlythinking = false;
+
+// ============= OPTIMIZED CONVERSATION BUFFER =============
+
+const conversationBuffer = {
+  messages: [],
+  lastActivity: Date.now(),
+  participants: new Set(),
+  silenceTimer: null,
+  isProcessing: false,
+};
+
+const CONVERSATION_CONFIG = {
+  groupSilenceDuration: 3000, // 3 seconds of silence from ALL users before processing
+  maxBufferSize: 10, // Maximum messages to buffer before forcing processing
+  minMessagesForGroup: 2, // Minimum messages needed to trigger group conversation mode
+};
 
 // Create the directories if they don't exist
 if (!fs.existsSync('./recordings')) {
@@ -72,8 +81,348 @@ if (!fs.existsSync('./chat_logs')) {
   fs.mkdirSync('./chat_logs');
 }
 
+// ============= TOOL DEFINITIONS =============
+const AVAILABLE_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "search_web",
+      description: "Search the web and return current information, news, facts, or events. You must formulate your own search query based on the user's message. Use this when you need up-to-date information or when the user asks about recent events.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "The search query. Be specific and clear. Formulate this based on what the user is asking about."
+          }
+        },
+        required: ["query"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_webpage",
+      description: "Search a specific webpage or domain for information. Provide the whole URL if possible, otherwise provide just the domain.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "The search query to look for on the webpage"
+          },
+          webpage: {
+            type: "string",
+            description: "The URL or domain to search (e.g., 'reddit.com' or 'https://example.com')"
+          }
+        },
+        required: ["query", "webpage"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "getDateTime",
+      description: "Get the current date and time in your local timezone. Use this when the user asks what time it is, what day it is, or the current date.",
+      parameters: {
+        type: "object",
+        properties: {},
+        required: []
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "calculate",
+      description: "Perform mathematical calculations. Supports basic arithmetic (+, -, *, /, ^, %), functions like sin, cos, tan, sqrt, log, and constants like pi and e. Examples: '2 + 2', 'sqrt(16)', 'sin(pi/2)', '15% of 200'",
+      parameters: {
+        type: "object",
+        properties: {
+          expression: {
+            type: "string",
+            description: "The mathematical expression to evaluate. Examples: '2+2', 'sqrt(144)', '(5*9)+3'"
+          }
+        },
+        required: ["expression"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "convert_units",
+      description: "Convert between different units of measurement. Supports temperature (fahrenheit/celsius), length (miles/km, feet/meters, inches/cm), weight (pounds/kg, ounces/grams), and volume (gallons/liters, cups/ml). Use underscores and 'to' format like 'fahrenheit_to_celsius' or shorthand like 'f_to_c', 'miles_to_km', 'lbs_to_kg'.",
+      parameters: {
+        type: "object",
+        properties: {
+          value: {
+            type: "number",
+            description: "The numerical value to convert"
+          },
+          conversion: {
+            type: "string",
+            description: "The conversion type in format 'from_to_to'. Examples: 'fahrenheit_to_celsius', 'miles_to_kilometers', 'pounds_to_kilograms', or shorthand: 'f_to_c', 'miles_to_km', 'lbs_to_kg'"
+          }
+        },
+        required: ["value", "conversion"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "roll_dice",
+      description: "Roll virtual RPG dice. Use standard dice notation like '2d6' (roll 2 six-sided dice), '1d20' (roll 1 twenty-sided die), '3d10' (roll 3 ten-sided dice). Common dice: d4, d6, d8, d10, d12, d20, d100.",
+      parameters: {
+        type: "object",
+        properties: {
+          dice_expression: {
+            type: "string",
+            description: "The dice expression in XdY format, where X is the number of dice and Y is the number of sides. Examples: '2d6', '1d20', '4d8'"
+          }
+        },
+        required: ["dice_expression"]
+      }
+    }
+  }
+];
+
+// Tools API endpoint
+const TOOLS_API_ENDPOINT = process.env.TOOLS_ENDPOINT || 'http://localhost:5001';
+
+// ============= TOOL EXECUTION FUNCTIONS =============
+
+async function executeSearchWeb(query) {
+  try {
+    logToConsole(`> [TOOL] Web Search: "${query}"`, 'info', 1);
+    
+    const response = await axios.post(`${TOOLS_API_ENDPOINT}/tools/search_web`, {
+      query: query
+    }, {
+      timeout: 60000 // 60 second timeout for web searches
+    });
+    
+    if (response.data.success) {
+      const result = response.data.result;
+      logToConsole(`> [TOOL] Search completed (${result.length} chars)`, 'info', 2);
+      return result;
+    } else {
+      logToConsole(`X [TOOL] Search failed: ${response.data.error}`, 'error', 1);
+      return `Web search error: ${response.data.error}`;
+    }
+    
+  } catch (error) {
+    logToConsole(`X [TOOL] Web search error: ${error.message}`, 'error', 1);
+    if (error.code === 'ECONNREFUSED') {
+      return `Error: Tools API server is not running. Please start it with: python ToolsAPI.py`;
+    }
+    return `Error performing web search: ${error.message}`;
+  }
+}
+
+async function executeSearchWebpage(query, webpage) {
+  try {
+    logToConsole(`> [TOOL] Searching webpage "${webpage}" for: "${query}"`, 'info', 1);
+    
+    const response = await axios.post(`${TOOLS_API_ENDPOINT}/tools/search_webpage`, {
+      query: query,
+      webpage: webpage
+    }, {
+      timeout: 60000
+    });
+    
+    if (response.data.success) {
+      const result = response.data.result;
+      logToConsole(`> [TOOL] Webpage search completed`, 'info', 2);
+      return result;
+    } else {
+      logToConsole(`X [TOOL] Webpage search failed: ${response.data.error}`, 'error', 1);
+      return `Webpage search error: ${response.data.error}`;
+    }
+    
+  } catch (error) {
+    logToConsole(`X [TOOL] Webpage search error: ${error.message}`, 'error', 1);
+    if (error.code === 'ECONNREFUSED') {
+      return `Error: Tools API server is not running. Please start it with: python ToolsAPI.py`;
+    }
+    return `Error searching webpage: ${error.message}`;
+  }
+}
+
+async function executeGetDateTime() {
+  try {
+    logToConsole(`> [TOOL] Getting current date/time`, 'info', 1);
+    
+    const response = await axios.get(`${TOOLS_API_ENDPOINT}/tools/getDateTime`, {
+      timeout: 5000
+    });
+    
+    if (response.data.success) {
+      const result = response.data.result;
+      logToConsole(`> [TOOL] DateTime: ${result}`, 'info', 2);
+      return result;
+    } else {
+      logToConsole(`X [TOOL] DateTime failed: ${response.data.error}`, 'error', 1);
+      return `DateTime error: ${response.data.error}`;
+    }
+    
+  } catch (error) {
+    logToConsole(`X [TOOL] DateTime error: ${error.message}`, 'error', 1);
+    if (error.code === 'ECONNREFUSED') {
+      return `Error: Tools API server is not running. Please start it with: python ToolsAPI.py`;
+    }
+    // Fallback to local time if API fails
+    const now = new Date();
+    const result = now.toLocaleString('en-US', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+    return `The current date and time is: ${result}`;
+  }
+}
+
+async function executeCalculate(expression) {
+  try {
+    logToConsole(`> [TOOL] Calculate: "${expression}"`, 'info', 1);
+    
+    const response = await axios.post(`${TOOLS_API_ENDPOINT}/tools/calculate`, {
+      expression: expression
+    }, {
+      timeout: 5000
+    });
+    
+    if (response.data.success) {
+      const result = response.data.result;
+      logToConsole(`> [TOOL] Calculation result: ${result}`, 'info', 2);
+      return result;
+    } else {
+      logToConsole(`X [TOOL] Calculation failed: ${response.data.error}`, 'error', 1);
+      return `Calculation error: ${response.data.error}`;
+    }
+    
+  } catch (error) {
+    logToConsole(`X [TOOL] Calculation error: ${error.message}`, 'error', 1);
+    if (error.code === 'ECONNREFUSED') {
+      return `Error: Tools API server is not running. Please start it with: python ToolsAPI.py`;
+    }
+    return `Error performing calculation: ${error.message}`;
+  }
+}
+
+async function executeConvertUnits(value, conversion) {
+  try {
+    logToConsole(`> [TOOL] Convert: ${value} ${conversion}`, 'info', 1);
+    
+    const response = await axios.post(`${TOOLS_API_ENDPOINT}/tools/convert_units`, {
+      value: value,
+      conversion: conversion
+    }, {
+      timeout: 5000
+    });
+    
+    if (response.data.success) {
+      const result = response.data.result;
+      logToConsole(`> [TOOL] Conversion result: ${result}`, 'info', 2);
+      return result;
+    } else {
+      logToConsole(`X [TOOL] Conversion failed: ${response.data.error}`, 'error', 1);
+      return `Unit conversion error: ${response.data.error}`;
+    }
+    
+  } catch (error) {
+    logToConsole(`X [TOOL] Conversion error: ${error.message}`, 'error', 1);
+    if (error.code === 'ECONNREFUSED') {
+      return `Error: Tools API server is not running. Please start it with: python ToolsAPI.py`;
+    }
+    return `Error converting units: ${error.message}`;
+  }
+}
+
+async function executeRollDice(diceExpression) {
+  try {
+    logToConsole(`> [TOOL] Roll Dice: "${diceExpression}"`, 'info', 1);
+    
+    const response = await axios.post(`${TOOLS_API_ENDPOINT}/tools/roll_dice`, {
+      dice_expression: diceExpression
+    }, {
+      timeout: 5000
+    });
+    
+    if (response.data.success) {
+      const result = response.data.result;
+      logToConsole(`> [TOOL] Dice roll result: ${result}`, 'info', 2);
+      return result;
+    } else {
+      logToConsole(`X [TOOL] Dice roll failed: ${response.data.error}`, 'error', 1);
+      return `Dice roll error: ${response.data.error}`;
+    }
+    
+  } catch (error) {
+    logToConsole(`X [TOOL] Dice roll error: ${error.message}`, 'error', 1);
+    if (error.code === 'ECONNREFUSED') {
+      return `Error: Tools API server is not running. Please start it with: python ToolsAPI.py`;
+    }
+    return `Error rolling dice: ${error.message}`;
+  }
+}
+
+async function executeTool(toolName, argsString) {
+  try {
+    const args = argsString ? JSON.parse(argsString) : {};
+    logToConsole(`> [TOOL] Executing: ${toolName}`, 'info', 1);
+    logToConsole(`> [TOOL] Arguments: ${JSON.stringify(args)}`, 'info', 2);
+    
+    let result;
+    switch(toolName) {
+      case 'search_web':
+        result = await executeSearchWeb(args.query);
+        break;
+      
+      case 'search_webpage':
+        result = await executeSearchWebpage(args.query, args.webpage);
+        break;
+      
+      case 'getDateTime':
+        result = await executeGetDateTime();
+        break;
+      
+      case 'calculate':
+        result = await executeCalculate(args.expression);
+        break;
+      
+      case 'convert_units':
+        result = await executeConvertUnits(args.value, args.conversion);
+        break;
+      
+      case 'roll_dice':
+        result = await executeRollDice(args.dice_expression);
+        break;
+      
+      default:
+        result = `Unknown tool: ${toolName}`;
+        logToConsole(`X [TOOL] Unknown tool requested: ${toolName}`, 'error', 1);
+    }
+    
+    return result;
+  } catch (error) {
+    logToConsole(`X [TOOL] Execution error: ${error.message}`, 'error', 1);
+    logToConsole(`X [TOOL] Stack: ${error.stack}`, 'error', 2);
+    return `Tool execution error: ${error.message}`;
+  }
+}
+
+// ============= END TOOL DEFINITIONS =============
+
 client.on('clientReady', async () => {
-  // Initialize database
+  // Initialize database (this generates the first session ID)
   await initializeDatabase();
   
   // Clean up any old recordings
@@ -88,7 +437,7 @@ client.on('clientReady', async () => {
     });
   });
 
-  logToConsole(`Logged in as ${client.user.tag}!`, 'info', 1);
+  logToConsole(`Logged in as ${client.user.tag}! Session ID: ${currentSessionId}`, 'info', 1);
 });
 
 client.on('interactionCreate', async interaction => {
@@ -105,13 +454,14 @@ client.on('interactionCreate', async interaction => {
         return;
       }
 
-      allowwithoutbip = false;
+      // Generate new session ID when joining voice chat
+      currentSessionId = generateSessionId();
+      logToConsole(`Started new voice session: ${currentSessionId}`, 'info', 1);
+
       allowwithouttrigger = false;
       transcribemode = false;
 
-      if (mode === 'silent') {
-        allowwithoutbip = true;
-      } else if (mode === 'free') {
+        if (mode === 'free') {
         allowwithouttrigger = true;
       } else if (mode === 'transcribe') {
         transcribemode = true;
@@ -141,19 +491,10 @@ client.on('interactionCreate', async interaction => {
       logToConsole('> Chat history reset!', 'info', 1);
       break;
 
-    case 'play':
-      const query = options.getString('query');
-      if (interaction.member.voice.channel) {
-        currentlythinking = true;
-        seatchAndPlayYouTube(query, interaction.user.id, connection, interaction.member.voice.channel);
-        await interaction.reply(`Playing: ${query}`);
-      } else {
-        await interaction.reply({ content: 'You need to join a voice channel first!', ephemeral: true });
-      }
-      break;
-
+    
     case 'leave':
       if (connection) {
+        logToConsole(`Ending voice session: ${currentSessionId}`, 'info', 1);
         connection.destroy();
         audioqueue = [];
 
@@ -166,182 +507,23 @@ client.on('interactionCreate', async interaction => {
         connection = null;
         chatHistory = {};
         logToConsole('> Left voice channel', 'info', 1);
+        
+        
         await interaction.reply({ content: 'Left voice channel.', ephemeral: true });
       } else {
         await interaction.reply({ content: 'I am not in a voice channel.', ephemeral: true });
       }
       break;
-
-    case 'search':
-      const searchQuery = options.getString('query');
-      currentlythinking = true;
-      logToConsole(`> Search query: ${searchQuery}`, 'info', 1);
-
-      // Acknowledge the interaction immediately
-      await interaction.deferReply();
-
-      const response = await sendTextToPerplexity(searchQuery);
-      const messageParts = splitMessage(response);
-
-      for (const part of messageParts) {
-        try {
-          // Edit the initial deferred reply with the first part
-          await interaction.editReply(part);
-          // For subsequent parts, use follow-up messages
-          for (let i = 1; i < messageParts.length; i++) {
-            await interaction.followUp(messageParts[i]);
-          }
-        } catch (error) {
-          console.error(`Failed to send message part: ${error}`);
-          await interaction.followUp("Oops! I encountered an error while sending my response.");
-          break;
-        }
-      }
-      break;
-
-    case 'reminder':
-      const time = options.getString('time');
-      const message = options.getString('message');
-      const userid = interaction.user.id;
-
-      // We need to parse the "time" option to get the timestamp. The format is the official discord one, <t:UNIX_TIMESTAMP>.
-      const timestamp = time.match(/<t:(\d+)>/);
-      if (!timestamp || timestamp.length < 2) {
-        await interaction.reply({ content: `Incorrect timestamp format.`, ephemeral: true });
-        return;
-      }
-
-      // Schedule the reminder
-      scheduleReminder(timestamp[1], message, userid);
-
-      await interaction.reply({ content: `Reminder set for ${time}.`, ephemeral: true });
-
-      break;
-
+    
     case 'help':
       await interaction.reply({ content: `Commands: \n
       \`/join\` - Join voice channel and start listening for trigger words.
-      \`/join silent\` - Join voice channel without the confirmation sounds.
       \`/join free\` - Join voice channel and listen without trigger words.
       \`/join transcribe\` - Join voice channel and save the conversation to a file which will be sent when using \`/leave\` command.
       \`/reset\` - Reset chat history. You may also say \`reset chat history\` in voice chat.
-      \`/play\` [song name or URL] - Play a song from YouTube. You may also say \`play [query] on YouTube\` or \`play [query] song\` with the bot trigger word.
       \`/leave\` - Leave voice channel. You may also say \`leave voice chat\` in voice chat.
-      \`/help\` - Display this message. \n
-      __Notes:__
-      If vision is enabled, sending an image mentioning the bot will have it react to it in voice chat.
-      A valid API key is required for the YouTube feature.`, ephemeral: true });
+      \`/help\` - Display this message.`, ephemeral: true });
       break;
-  }
-});
-
-client.on('messageCreate', async message => {
-  // Ignore own messages and system messages
-  if (message.author.id === client.user.id || message.system) return;
-
-  // Check if the bot was mentioned with a picture attached
-  if (message.mentions.has(client.user) && message.attachments.size > 0 && message.member.voice.channel) {
-    // Get image URL from the message
-    const imageUrl = message.attachments.first().url;
-    const userId = message.author.id;
-    captionImage(imageUrl, userId, connection, message.member.voice.channel);
-    return;
-  }
-
-  const isMention = message.mentions.has(client.user);
-  const isReply = message.reference && message.reference.messageId;
-  const isInThread = message.channel.isThread() && await isThreadFromBot(message);
-
-  if (process.env.LLM_TEXT.toLowerCase() === "false") {
-    isMention = false;
-    isReply = false;
-    isInThread = false;
-  }
-
-  if (isInThread) {
-    const threadId = message.channel.isThread() ? message.channel.id : null;
-    
-    await message.channel.sendTyping();
-    logToConsole('> Message in thread', 'info', 1);
-    // Handle messages within a thread
-    const response = await sendToLLMInThread(message, threadId);
-    const messageParts = splitMessage(response);
-
-    // Save to chat log (now async)
-    await saveChatLog(message.author.id, message.content, response, message.channel);
-
-    for (const part of messageParts) {
-      try {
-        await message.channel.send(part);
-      } catch (error) {
-        console.error(`Failed to send message part: ${error}`);
-        await message.channel.send("Oops! I encountered an error while sending my response.");
-        break;
-      }
-    }
-  } else if (isReply) {
-    // Continue the conversation
-    const repliedMessage = await message.channel.messages.fetch(message.reference.messageId);
-    if (repliedMessage.author.id !== client.user.id) return; // Only continue if replying to the bot's message
-    await message.channel.sendTyping();
-    logToConsole('> Reply to message', 'info', 1);
-    const response = await sendTextToLLM(message);
-    const messageParts = splitMessage(response);
-
-    // Save to chat log (now async)
-    await saveChatLog(message.author.id, message.content, response, message.channel);
-
-    // Send the first part as a reply
-    try {
-      await message.reply(messageParts[0]);
-    } catch (error) {
-      console.error(`Failed to send reply: ${error}`);
-      await message.channel.send("Oops! I encountered an error while sending my response.");
-      return; // Stop further processing if the reply fails
-    }
-
-    // Send the remaining parts as regular messages
-    for (let i = 1; i < messageParts.length; i++) {
-      try {
-        await message.channel.send(messageParts[i]);
-      } catch (error) {
-        console.error(`Failed to send message part: ${error}`);
-        // Optionally, send a message to the channel indicating an error occurred
-        await message.channel.send("Oops! I encountered an error while sending my response.");
-        break; // Stop sending more parts to avoid spamming in case of persistent errors
-      }
-    }
-  } else if (isMention) {
-    await message.channel.sendTyping();
-    logToConsole('> Mentioned in message', 'info', 1);
-
-    // Start a new conversation
-    const response = await sendTextToLLM(message);
-    const messageParts = splitMessage(response);
-
-    // Save to chat log (now async)
-    await saveChatLog(message.author.id, message.content, response, message.channel);
-
-    // Send the first part as a reply
-    try {
-      await message.reply(messageParts[0]);
-    } catch (error) {
-      console.error(`Failed to send reply: ${error}`);
-      await message.channel.send("Oops! I encountered an error while sending my response.");
-      return; // Stop further processing if the reply fails
-    }
-
-    // Send the remaining parts as regular messages
-    for (let i = 1; i < messageParts.length; i++) {
-      try {
-        await message.channel.send(messageParts[i]);
-      } catch (error) {
-        console.error(`Failed to send message part: ${error}`);
-        // Optionally, send a message to the channel indicating an error occurred
-        await message.channel.send("Oops! I encountered an error while sending my response.");
-        break; // Stop sending more parts to avoid spamming in case of persistent errors
-      }
-    }
   }
 });
 
@@ -363,37 +545,450 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 
 async function initializeDatabase() {
   try {
+    // Only initialize database if chat logging or memory system is enabled
+    const chatLogEnabled = process.env.CHAT_LOG !== "false";
+    const memoryEnabled = process.env.MEMORY_SYSTEM !== "false";
+    
+    if (!chatLogEnabled && !memoryEnabled) {
+      logToConsole('Both chat logging and memory system are disabled, skipping database initialization', 'info', 1);
+      currentSessionId = generateSessionId();
+      return;
+    }
+
     db = await open({
       filename: './chat_logs/chat_history.db',
       driver: sqlite3.Database
     });
 
-    // Create the chat_logs table if it doesn't exist
-    await db.exec(`
-      CREATE TABLE IF NOT EXISTS chat_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL,
-        display_name TEXT NOT NULL,
-        user_message TEXT NOT NULL,
-        ai_response TEXT NOT NULL,
-        timestamp TEXT NOT NULL,
-        date_only TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_user_id ON chat_logs(user_id);
-      CREATE INDEX IF NOT EXISTS idx_date ON chat_logs(date_only);
-      CREATE INDEX IF NOT EXISTS idx_timestamp ON chat_logs(timestamp);
-    `);
+    // Create tables based on what's enabled
+    let tableCreation = '';
+    
+    if (chatLogEnabled) {
+      tableCreation += `
+        CREATE TABLE IF NOT EXISTS chat_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          display_name TEXT NOT NULL,
+          user_message TEXT NOT NULL,
+          ai_response TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          date_only TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_id ON chat_logs(user_id);
+        CREATE INDEX IF NOT EXISTS idx_date ON chat_logs(date_only);
+        CREATE INDEX IF NOT EXISTS idx_timestamp ON chat_logs(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_session_id ON chat_logs(session_id);
+      `;
+    }
+    
+    if (memoryEnabled) {
+      tableCreation += `
+        CREATE TABLE IF NOT EXISTS memories (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          keywords TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          content TEXT NOT NULL,
+          memory_type TEXT DEFAULT 'general',
+          importance_score INTEGER DEFAULT 5,
+          timestamp TEXT NOT NULL,
+          access_count INTEGER DEFAULT 0,
+          last_accessed TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_user_id ON memories(user_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_keywords ON memories(keywords);
+        CREATE INDEX IF NOT EXISTS idx_memory_type ON memories(memory_type);
+        CREATE INDEX IF NOT EXISTS idx_memory_session_id ON memories(session_id);
+      `;
+    }
 
-    logToConsole('Database initialized successfully', 'info', 1);
+    await db.exec(tableCreation);
+
+    // Generate initial session ID
+    currentSessionId = generateSessionId();
+    
+    // Load memory keywords only if memory system is enabled
+    if (memoryEnabled) {
+      await loadMemoryKeywords();
+    }
+
+    logToConsole(`Database initialized successfully with session ID: ${currentSessionId}`, 'info', 1);
   } catch (error) {
     logToConsole(`Error initializing database: ${error.message}`, 'error', 1);
   }
 }
 
+function generateSessionId() {
+  return `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
+
+// ==== MEMORY FUNCTIONS ====
+async function loadMemoryKeywords() {
+  if (!db) return;
+  
+  try {
+    const memories = await db.all(`SELECT keywords FROM memories`);
+    memoryKeywords.clear();
+    
+    memories.forEach(memory => {
+      const keywords = memory.keywords.split(',').map(k => k.trim().toLowerCase());
+      keywords.forEach(keyword => memoryKeywords.add(keyword));
+    });
+    
+    logToConsole(`Loaded ${memoryKeywords.size} memory keywords`, 'info', 2);
+  } catch (error) {
+    logToConsole(`Error loading memory keywords: ${error.message}`, 'error', 1);
+  }
+}
+
+async function saveMemory(userId, keywords, summary, content, memoryType = 'general', importanceScore = 5) {
+  if (process.env.MEMORY_SYSTEM === "false" || process.env.MEMORY_SYSTEM === false) {
+    logToConsole('> Memory system is disabled', 'info', 2);
+    return false;
+  }
+  
+  logToConsole(`> [MEMORY SAVE] User: ${userId}, Session: ${currentSessionId}`, 'info', 1);
+  logToConsole(`> [MEMORY SAVE] DB Status: ${db ? 'Connected' : 'NULL'}`, db ? 'info' : 'error', 1);
+  
+  if (!db) {
+    logToConsole('X [MEMORY SAVE] Database not initialized', 'error', 1);
+    return false;
+  }
+  
+  if (!currentSessionId) {
+    logToConsole('X [MEMORY SAVE] No current session ID', 'error', 1);
+    return false;
+  }
+
+  try {
+    const timestamp = new Date().toISOString();
+    const keywordString = Array.isArray(keywords) ? keywords.join(', ') : keywords;
+    
+    logToConsole(`> [MEMORY SAVE] Keywords: "${keywordString}"`, 'info', 1);
+    logToConsole(`> [MEMORY SAVE] Summary: "${summary}"`, 'info', 1);
+    
+    const result = await db.run(`
+      INSERT INTO memories (user_id, session_id, keywords, summary, content, memory_type, importance_score, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `, [userId, currentSessionId, keywordString, summary, content, memoryType, importanceScore, timestamp]);
+
+    logToConsole(`> [MEMORY SAVE] SUCCESS - ID: ${result.lastID}`, 'info', 1);
+
+    // Update keyword set
+    const keywordArray = keywordString.split(',').map(k => k.trim().toLowerCase());
+    keywordArray.forEach(keyword => memoryKeywords.add(keyword));
+
+    return true;
+  } catch (error) {
+    logToConsole(`X [MEMORY SAVE] ERROR: ${error.message}`, 'error', 1);
+    return false;
+  }
+}
+
+async function findMemoriesByKeywords(userId, keywords, limit = 5) {
+  if (process.env.MEMORY_SYSTEM === "false" || process.env.MEMORY_SYSTEM === false) {
+    return [];
+  }
+  
+  if (!db || !currentSessionId) return [];
+
+  try {
+    const keywordArray = Array.isArray(keywords) ? keywords : keywords.split(',').map(k => k.trim());
+    const searchTerms = keywordArray.map(k => `%${k.toLowerCase()}%`);
+    
+    // Build dynamic query based on number of keywords
+    const whereConditions = searchTerms.map(() => `LOWER(keywords) LIKE ? OR LOWER(summary) LIKE ? OR LOWER(content) LIKE ?`);
+    const queryParams = [];
+    
+    searchTerms.forEach(term => {
+      queryParams.push(term, term, term); // For keywords, summary, and content
+    });
+    
+    // EXCLUDE memories from the current session
+    const memories = await db.all(`
+      SELECT id, keywords, summary, content, memory_type, importance_score, timestamp, access_count, session_id
+      FROM memories 
+      WHERE user_id = ? AND session_id != ? AND (${whereConditions.join(' OR ')})
+      ORDER BY importance_score DESC, access_count DESC, timestamp DESC
+      LIMIT ?
+    `, [userId, currentSessionId, ...queryParams, limit]);
+
+    // Update access count for retrieved memories
+    for (const memory of memories) {
+      await db.run(`
+        UPDATE memories 
+        SET access_count = access_count + 1, last_accessed = ? 
+        WHERE id = ?
+      `, [new Date().toISOString(), memory.id]);
+    }
+
+    logToConsole(`Found ${memories.length} memories from previous sessions for user ${userId}`, 'info', 2);
+    return memories;
+  } catch (error) {
+    logToConsole(`Error finding memories: ${error.message}`, 'error', 1);
+    return [];
+  }
+}
+
+async function findMemoryById(userId, memoryId) {
+  if (!db) return null;
+
+  try {
+    const memory = await db.get(`
+      SELECT * FROM memories 
+      WHERE id = ? AND user_id = ?
+    `, [memoryId, userId]);
+
+    return memory;
+  } catch (error) {
+    logToConsole(`Error finding memory by ID: ${error.message}`, 'error', 1);
+    return null;
+  }
+}
+
+async function updateMemory(userId, memoryId, updates) {
+  if (!db) return false;
+
+  try {
+    const setParts = [];
+    const values = [];
+    
+    if (updates.keywords) {
+      setParts.push('keywords = ?');
+      values.push(Array.isArray(updates.keywords) ? updates.keywords.join(', ') : updates.keywords);
+    }
+    if (updates.summary) {
+      setParts.push('summary = ?');
+      values.push(updates.summary);
+    }
+    if (updates.content) {
+      setParts.push('content = ?');
+      values.push(updates.content);
+    }
+    if (updates.importance_score) {
+      setParts.push('importance_score = ?');
+      values.push(updates.importance_score);
+    }
+
+    if (setParts.length === 0) return false;
+
+    values.push(userId, memoryId);
+
+    await db.run(`
+      UPDATE memories 
+      SET ${setParts.join(', ')} 
+      WHERE user_id = ? AND id = ?
+    `, values);
+
+    // Reload keywords if they were updated
+    if (updates.keywords) {
+      await loadMemoryKeywords();
+    }
+
+    logToConsole(`Memory ${memoryId} updated for user ${userId}`, 'info', 1);
+    return true;
+  } catch (error) {
+    logToConsole(`Error updating memory: ${error.message}`, 'error', 1);
+    return false;
+  }
+}
+
+async function deleteMemory(userId, memoryId) {
+  if (!db) return false;
+
+  try {
+    const result = await db.run(`
+      DELETE FROM memories 
+      WHERE id = ? AND user_id = ?
+    `, [memoryId, userId]);
+
+    if (result.changes > 0) {
+      // Reload keywords after deletion
+      await loadMemoryKeywords();
+      logToConsole(`Memory ${memoryId} deleted for user ${userId}`, 'info', 1);
+      return true;
+    }
+    
+    return false;
+  } catch (error) {
+    logToConsole(`Error deleting memory: ${error.message}`, 'error', 1);
+    return false;
+  }
+}
+
+function checkForMemoryKeywords(text) {
+  if (process.env.MEMORY_SYSTEM === "false" || process.env.MEMORY_SYSTEM === false) {
+    return [];
+  }
+  
+  const words = text.toLowerCase().split(/\s+/);
+  const foundKeywords = [];
+  
+  words.forEach(word => {
+    // Remove punctuation
+    const cleanWord = word.replace(/[^\w]/g, '');
+    if (memoryKeywords.has(cleanWord)) {
+      foundKeywords.push(cleanWord);
+    }
+  });
+  
+  return foundKeywords;
+}
+
+async function parseMemoryTags(response, userId) {
+  if (process.env.MEMORY_SYSTEM === "false" || process.env.MEMORY_SYSTEM === false) {
+    logToConsole('> Memory system is disabled, skipping memory tag parsing', 'info', 2);
+    // Still need to remove the tags from the response
+    const memoryRegex = /<memories>([\s\S]*?)<\/memories>/g;
+    return response.replace(memoryRegex, '').trim();
+  }
+  
+  logToConsole(`> Parsing memory tags for user ${userId}, session: ${currentSessionId}`, 'info', 1);
+  
+  const memoryRegex = /<memories>([\s\S]*?)<\/memories>/g;
+  const matches = [...response.matchAll(memoryRegex)];
+  
+  logToConsole(`> Found ${matches.length} memory tags`, 'info', 1);
+  
+  for (let i = 0; i < matches.length; i++) {
+    const match = matches[i];
+    const memoryContent = match[1].trim();
+    logToConsole(`> Memory tag ${i + 1} raw content: "${memoryContent}"`, 'info', 1);
+    
+    // Handle both formats: comma-separated AND newline-separated
+    let parts = [];
+    
+    // Try comma-separated format first
+    if (memoryContent.includes(',') && !memoryContent.includes('\n')) {
+      // Single line comma-separated format
+      parts = memoryContent.split(',').map(part => part.trim()).filter(part => part.length > 0);
+      logToConsole(`> Parsed as comma-separated: ${JSON.stringify(parts)}`, 'info', 2);
+    } else {
+      // Multi-line format (original)
+      parts = memoryContent.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+      logToConsole(`> Parsed as multi-line: ${JSON.stringify(parts)}`, 'info', 2);
+    }
+    
+    if (parts.length < 2) {
+      logToConsole(`> Skipping memory ${i + 1}: insufficient parts (need at least 2)`, 'warn', 1);
+      continue;
+    }
+    
+    // Check if this is a modification/deletion command
+    if (parts[0].toLowerCase().startsWith('modify/') || parts[0].toLowerCase().startsWith('delete/')) {
+      logToConsole(`> Processing memory command: ${parts[0]}`, 'info', 1);
+      await handleMemoryCommand(parts, userId);
+    } else {
+      // Regular memory storage
+      const keywords = parts[0];
+      const summary = parts[1];
+      const content = parts.length > 2 ? parts.slice(2).join(' ') : summary;
+      
+      logToConsole(`> Saving memory - Keywords: "${keywords}", Summary: "${summary}"`, 'info', 1);
+      const success = await saveMemory(userId, keywords, summary, content);
+      logToConsole(`> Memory save result: ${success ? 'SUCCESS' : 'FAILED'}`, success ? 'info' : 'error', 1);
+    }
+  }
+  
+  // Remove memory tags from response
+  const cleanedResponse = response.replace(memoryRegex, '').trim();
+  return cleanedResponse;
+}
+
+async function handleMemoryCommand(lines, userId) {
+  const command = lines[0].toLowerCase();
+  
+  if (command.startsWith('modify/')) {
+    // Extract memory identifier from the command
+    const identifier = command.replace('modify/', '').trim();
+    const newSummary = lines[1];
+    const newContent = lines.slice(2).join('\n') || newSummary;
+    
+    // Find memory by ID or by searching keywords/summary
+    let memory = null;
+    const memoryId = parseInt(identifier);
+    
+    if (!isNaN(memoryId)) {
+      memory = await findMemoryById(userId, memoryId);
+    } else {
+      // Search by keywords/summary
+      const foundMemories = await findMemoriesByKeywords(userId, identifier, 1);
+      if (foundMemories.length > 0) {
+        memory = foundMemories[0];
+      }
+    }
+    
+    if (memory) {
+      await updateMemory(userId, memory.id, {
+        summary: newSummary,
+        content: newContent
+      });
+    }
+  } else if (command.startsWith('delete/')) {
+    // Extract memory identifier
+    const identifier = command.replace('delete/', '').trim();
+    
+    let memory = null;
+    const memoryId = parseInt(identifier);
+    
+    if (!isNaN(memoryId)) {
+      memory = await findMemoryById(userId, memoryId);
+    } else {
+      // Search by keywords/summary
+      const foundMemories = await findMemoriesByKeywords(userId, identifier, 1);
+      if (foundMemories.length > 0) {
+        memory = foundMemories[0];
+      }
+    }
+    
+    if (memory) {
+      await deleteMemory(userId, memory.id);
+    }
+  }
+}
+
+function formatMemoriesForContext(memories) {
+  if (memories.length === 0) return "";
+  
+  let formatted = "=== RELEVANT MEMORIES ===\n";
+  memories.forEach((memory, index) => {
+    const date = new Date(memory.timestamp).toLocaleDateString();
+    formatted += `${index + 1}. ${memory.summary} (${date}, accessed ${memory.access_count}x)\n`;
+    if (memory.content !== memory.summary && memory.content.length < 200) {
+      formatted += `   Details: ${memory.content}\n`;
+    }
+  });
+  formatted += "=== END MEMORIES ===\n\n";
+  
+  return formatted;
+}
+
+function getMemorySystemPrompt() {
+  if (process.env.MEMORY_SYSTEM === "false" || process.env.MEMORY_SYSTEM === false) {
+    return ""; // Return empty string if disabled
+  }
+  
+  return `
+=== MEMORY SYSTEM INSTRUCTIONS === Memories are separate from Recent Conversation History. During conversations or when you meet a new person, you should consider storing or modifying memories by utilizing one of the three formats listed. Add a new memory: <memories>[ keywords: words, separated, by, commas, go, here ],[ Brief summary of what to remember ],[ Optional: Relevant conversation excerpts or more detailed content or leave this blank ]</memories> You can also modify existing memories: <memories>modify/[ memory ID or a keyword accociated with memory ],[ New summary ],[ New detailed content ]</memories> Or you can delete outdated memories: <memories>delete/[ memory ID or a keyword accociated with memory ]</memories> Guidelines: Store memories about: user preferences, important facts, interesting topics. Keep summaries concise but informative. Keywords are triggered by users, and will automatically remind you of your memory in a later conversation. Use clear keywords that you think a user might say in the future within the same or similar context. Update or delete memories that become outdated or incorrect. Memory System formats should be added after your response and will not be visible to users. === END MEMORY INSTRUCTIONS ===
+`;
+}
+
 // Chat logging functions - Add these after your existing variables
 async function saveChatLog(userId, userMessage, aiResponse, channel) {
+  if (process.env.CHAT_LOG === "false" || process.env.CHAT_LOG === false) {
+    logToConsole('> Chat logging is disabled', 'info', 2);
+    return;
+  }
+  
   if (!db) {
     logToConsole('Database not initialized', 'error', 1);
+    return;
+  }
+
+  if (!currentSessionId) {
+    logToConsole('No current session ID', 'error', 1);
     return;
   }
 
@@ -403,19 +998,28 @@ async function saveChatLog(userId, userMessage, aiResponse, channel) {
     const dateOnly = timestamp.split('T')[0];
 
     await db.run(`
-      INSERT INTO chat_logs (user_id, display_name, user_message, ai_response, timestamp, date_only)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `, [userId, displayName, userMessage, aiResponse, timestamp, dateOnly]);
+      INSERT INTO chat_logs (user_id, session_id, display_name, user_message, ai_response, timestamp, date_only)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [userId, currentSessionId, displayName, userMessage, aiResponse, timestamp, dateOnly]);
 
-    logToConsole(`Chat log saved for user ${userId}`, 'info', 2);
+    logToConsole(`Chat log saved for user ${userId} in session ${currentSessionId}`, 'info', 2);
   } catch (error) {
     logToConsole(`Error saving chat log: ${error.message}`, 'error', 1);
   }
 }
 
 async function getRecentChatLogs(userId, days = 7, maxEntries = 50) {
+  if (process.env.CHAT_LOG === "false" || process.env.CHAT_LOG === false) {
+    return [];
+  }
+  
   if (!db) {
     logToConsole('Database not initialized', 'error', 1);
+    return [];
+  }
+
+  if (!currentSessionId) {
+    logToConsole('No current session ID', 'error', 1);
     return [];
   }
 
@@ -424,13 +1028,14 @@ async function getRecentChatLogs(userId, days = 7, maxEntries = 50) {
     cutoffDate.setDate(cutoffDate.getDate() - days);
     const cutoffDateString = cutoffDate.toISOString().split('T')[0];
 
+    // EXCLUDE current session, just like memories do
     const logs = await db.all(`
-      SELECT display_name, user_message, ai_response, timestamp
+      SELECT display_name, user_message, ai_response, timestamp, session_id
       FROM chat_logs
-      WHERE user_id = ? AND date_only >= ?
+      WHERE user_id = ? AND session_id != ? AND date_only >= ?
       ORDER BY timestamp DESC
       LIMIT ?
-    `, [userId, cutoffDateString, maxEntries]);
+    `, [userId, currentSessionId, cutoffDateString, maxEntries]);
 
     // Reverse to get chronological order (oldest first)
     return logs.reverse();
@@ -441,9 +1046,9 @@ async function getRecentChatLogs(userId, days = 7, maxEntries = 50) {
 }
 
 function formatChatLogsForContext(logs) {
-  if (logs.length === 0) return "No previous chat history found.";
+  if (logs.length === 0) return "";
   
-  let formattedLogs = "Previous conversation history:\n\n";
+  let formattedLogs = "=== RECENT CONVERSATION HISTORY ===\n";
   
   logs.forEach((log, index) => {
     const date = new Date(log.timestamp).toLocaleDateString();
@@ -454,35 +1059,41 @@ function formatChatLogsForContext(logs) {
     formattedLogs += `Assistant: ${log.ai_response}\n\n`;
   });
   
+  formattedLogs += "=== END HISTORY ===\n\n";
   return formattedLogs;
 }
 
 function handleRecording(connection, channel) {
   const receiver = connection.receiver;
+  
   channel.members.forEach(member => {
     if (member.user.bot) return;
+    setupUserListener(member.user.id, receiver, connection, channel);
+  });
+}
 
-    const filePath = `./recordings/${member.user.id}.pcm`;
-    const writeStream = fs.createWriteStream(filePath);
-    const listenStream = receiver.subscribe(member.user.id, {
-      end: {
-        behavior: EndBehaviorType.AfterSilence,
-        duration: process.env.WAIT_TIME,
-      },
-    });
+function setupUserListener(userId, receiver, connection, channel) {
+  const filePath = `./recordings/${userId}.pcm`;
+  const writeStream = fs.createWriteStream(filePath);
+  
+  const listenStream = receiver.subscribe(userId, {
+    end: {
+      behavior: EndBehaviorType.AfterSilence,
+      duration: process.env.WAIT_TIME,
+    },
+  });
 
-    const opusDecoder = new prism.opus.Decoder({
-      frameSize: 960,
-      channels: 1,
-      rate: 48000,
-    });
+  const opusDecoder = new prism.opus.Decoder({
+    frameSize: 960,
+    channels: 1,
+    rate: 48000,
+  });
 
-    listenStream.pipe(opusDecoder).pipe(writeStream);
+  listenStream.pipe(opusDecoder).pipe(writeStream);
 
-    writeStream.on('finish', () => {
-      logToConsole(`> Audio recorded for ${member.user.username}`, 'info', 2);
-      convertAndHandleFile(filePath, member.user.id, connection, channel);
-    });
+  writeStream.on('finish', () => {
+    logToConsole(`> Audio recorded for ${userId}`, 'info', 2);
+    convertAndHandleFile(filePath, userId, connection, channel);
   });
 }
 
@@ -512,38 +1123,145 @@ function handleRecordingForUser(userID, connection, channel) {
   });
 }
 
-function convertAndHandleFile(filePath, userid, connection, channel) {
+function convertAndHandleFile(filePath, userId, connection, channel) {
   const mp3Path = filePath.replace('.pcm', '.mp3');
+  
   ffmpeg(filePath)
-  .inputFormat('s16le')
-  .audioChannels(1)
-  .format('mp3')
-  .on('error', (err) => {
-    logToConsole(`X Error converting file: ${err.message}`, 'error', 1);
-    currentlythinking = false;
-  })
-  .save(mp3Path)
-  .on('end', () => {
-    logToConsole(`> Converted to MP3: ${mp3Path}`, 'info', 2);
-    sendAudioToAPI(mp3Path, userid, connection, channel);
+    .inputFormat('s16le')
+    .audioChannels(1)
+    .format('mp3')
+    .on('error', (err) => {
+      logToConsole(`X Error converting file: ${err.message}`, 'error', 1);
+      currentlythinking = false;
+    })
+    .save(mp3Path)
+    .on('end', () => {
+      logToConsole(`> Converted to MP3: ${mp3Path}`, 'info', 2);
+      sendAudioToAPI(mp3Path, userId, connection, channel);
+    });
+}
+
+// ============= CONVERSATION BUFFER DECISION LOGIC =============
+async function shouldProcessConversationBuffer() {
+  // Force process if buffer is full
+  if (conversationBuffer.messages.length >= CONVERSATION_CONFIG.maxBufferSize) {
+    logToConsole('> Buffer full, forcing conversation processing', 'info', 1);
+    return true;
+  }
+  
+  // Check if bot was directly addressed in latest message
+  const latestMessage = conversationBuffer.messages[conversationBuffer.messages.length - 1];
+  const hasTrigger = botnames.some(name => {
+    const regex = new RegExp(`\\b${name}\\b`, 'i');
+    return regex.test(latestMessage.transcription) || allowwithouttrigger;
   });
+  
+  if (hasTrigger) {
+    logToConsole('> Bot was addressed, processing immediately', 'info', 1);
+    return true;
+  }
+  
+  // If only one person speaking, process immediately (maintain old behavior for solo users)
+  if (conversationBuffer.participants.size === 1) {
+    return true;
+  }
+  
+  // For group conversations, wait for silence timer
+  return false;
+}
+
+// ============= PROCESS BUFFERED CONVERSATION =============
+async function processConversationBuffer(connection, channel) {
+  if (conversationBuffer.isProcessing || conversationBuffer.messages.length === 0) {
+    return;
+  }
+  
+  conversationBuffer.isProcessing = true;
+  currentlythinking = true;
+  
+  // Build conversation context
+  const conversationText = conversationBuffer.messages
+    .map(msg => `${msg.displayName}: ${msg.transcription}`)
+    .join('\n');
+  
+  logToConsole(`> Processing buffered conversation (${conversationBuffer.messages.length} messages from ${conversationBuffer.participants.size} users)`, 'info', 1);
+  logToConsole(`> Conversation:\n${conversationText}`, 'info', 2);
+  
+  // Determine primary user for chat history (use last speaker or most active)
+  const userMessageCounts = {};
+  conversationBuffer.messages.forEach(msg => {
+    userMessageCounts[msg.userId] = (userMessageCounts[msg.userId] || 0) + 1;
+  });
+  const primaryUserId = Object.keys(userMessageCounts).reduce((a, b) => 
+    userMessageCounts[a] > userMessageCounts[b] ? a : b
+  );
+  
+  // Check for commands
+  const lowerConversation = conversationText.toLowerCase();
+  if (lowerConversation.includes("reset") && lowerConversation.includes("chat") && lowerConversation.includes("history")) {
+    chatHistory = {};
+    logToConsole('> Chat history reset!', 'info', 1);
+    clearConversationBuffer();
+    currentlythinking = false;
+    return;
+  } else if (lowerConversation.includes("leave") && lowerConversation.includes("voice") && lowerConversation.includes("chat")) {
+    connection.destroy();
+    connection = null;
+    chatHistory = {};
+    logToConsole('> Left voice channel', 'info', 1);
+    clearConversationBuffer();
+    currentlythinking = false;
+    return;
+  }
+  
+  // Send to LLM with optimized context
+  await sendToLLM(conversationText, primaryUserId, conversationBuffer.participants, connection, channel);
+  
+  // Clear buffer after processing
+  clearConversationBuffer();
+  currentlythinking = false;
+}
+
+function clearConversationBuffer() {
+  conversationBuffer.messages = [];
+  conversationBuffer.participants.clear();
+  conversationBuffer.isProcessing = false;
+  if (conversationBuffer.silenceTimer) {
+    clearTimeout(conversationBuffer.silenceTimer);
+    conversationBuffer.silenceTimer = null;
+  }
 }
 
 async function sendAudioToAPI(fileName, userId, connection, channel) {
+  // Check if bot is currently thinking
+  if (currentlythinking) {
+    logToConsole('> Bot is currently thinking, skipping this audio input...', 'info', 2);
+    // Cleanup files
+    try {
+      fs.unlinkSync(fileName);
+      const pcmPath = fileName.replace('.mp3', '.pcm');
+      fs.unlinkSync(pcmPath);
+    } catch (cleanupError) {
+      // Silent fail on cleanup
+    }
+    restartListening(userId, connection, channel);
+    return;
+  }
+
   const formData = new FormData();
   formData.append('model', process.env.STT_MODEL);
   formData.append('file', fs.createReadStream(fileName));
 
   try {
-    const response = await axios.post(process.env.STT_ENDPOINT + '/v1/audio/transcriptions', formData, {
-      headers: {
-        ...formData.getHeaders(),
-      },
-    });
-    let transcription = response.data.text;
-    let transcriptionwithoutpunctuation = transcription.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g,"");
-    transcriptionwithoutpunctuation = transcriptionwithoutpunctuation.toLowerCase();
-
+    const response = await axios.post(
+      process.env.STT_ENDPOINT + '/v1/audio/transcriptions',
+      formData,
+      { headers: { ...formData.getHeaders() } }
+    );
+    
+    let transcription = cleanTranscription(response.data.text);
+    
+    // Ignore background noise triggers
     const ignoreTriggers = ['Thank you.', 'Bye.'];
     if (ignoreTriggers.some(trigger => transcription.includes(trigger))) {
       logToConsole('> Ignoring background/keyboard sounds.', 'info', 2);
@@ -552,202 +1270,85 @@ async function sendAudioToAPI(fileName, userId, connection, channel) {
     }
 
     logToConsole(`> Transcription for ${userId}: "${transcription}"`, 'info', 1);
-
-    // If alarm is ongoing and transcription is 'stop', stop the alarm
-    if ((alarmongoing || currentlythinking) && (transcriptionwithoutpunctuation.toLowerCase().includes('stop') || transcriptionwithoutpunctuation.toLowerCase().includes('shut up') || transcriptionwithoutpunctuation.toLowerCase().includes('fuck off'))) {
-      playSound(connection, 'command');
-      alarmongoing = false;
-      currentlythinking = false;
-      audioqueue = [];
-      logToConsole('> Bot stopped.', 'info', 1);
-      restartListening(userId, connection, channel);
-      return;
+    
+    // Add to conversation buffer
+    const displayName = getDisplayName(userId, channel);
+    conversationBuffer.messages.push({
+      userId,
+      displayName,
+      transcription,
+      timestamp: Date.now(),
+    });
+    conversationBuffer.participants.add(userId);
+    conversationBuffer.lastActivity = Date.now();
+    
+    // Clear existing silence timer
+    if (conversationBuffer.silenceTimer) {
+      clearTimeout(conversationBuffer.silenceTimer);
     }
-
-    if(currentlythinking){
-      logToConsole('> Bot is already thinking, ignoring transcription.', 'info', 2);
-      restartListening(userId, connection, channel);
-      return;
-    }
-
-    // Check if the transcription includes the bot's name
-    if (botnames.some(name => {
-      const regex = new RegExp(`\\b${name}\\b`, 'i');
-      return regex.test(transcription) || allowwithouttrigger;
-    })) {
-        // Ignore if the string is a single word
-        if (transcription.split(' ').length <= 1) {
-          currentlythinking = false;
-          logToConsole('> Ignoring single word command.', 'info', 2);
-          restartListening(userId, connection, channel);
-          return;
-        }
-
-        // Remove the first occurrence of the bot's name from the transcription
-        for (const name of botnames) {
-          transcription = transcription.replace(new RegExp(`\\b${name}\\b`, 'i'), '').trim();
-        }
-
-        // Check if transcription is a command
-        if (transcriptionwithoutpunctuation.includes("reset") && transcriptionwithoutpunctuation.includes("chat") && transcriptionwithoutpunctuation.includes("history")) {
-          playSound(connection, 'command');
-          currentlythinking = false;
-          chatHistory = {};
-          logToConsole('> Chat history reset!', 'info', 1);
-          restartListening(userId, connection, channel);
-          return;
-        }
-        else if (transcriptionwithoutpunctuation.includes("leave") && transcriptionwithoutpunctuation.includes("voice") && transcriptionwithoutpunctuation.includes("chat")) {
-          playSound(connection, 'command');
-          currentlythinking = false;
-          connection.destroy();
-          connection = null;
-          chatHistory = {};
-          logToConsole('> Left voice channel', 'info', 1);
-          return;
-        }
-
-        // Check for specific triggers
-        const songTriggers = [['play', 'song'], ['play', 'youtube']];
-        const timerTriggers = [['set', 'timer'], ['start', 'timer'], ['set', 'alarm'], ['start', 'alarm']];
-        const internetTriggers = ['search', 'internet'];
-        const cancelTimerTriggers = [['cancel', 'timer'],['cancel', 'alarm'],['can sell', 'timer'],['can sell', 'alarm'],['consult', 'timer'],['consult', 'alarm']];
-        const listTimerTriggers = [['list', 'timer'],['list', 'alarm'],['least', 'timer'],['least', 'alarm'],['when', 'next', 'timer'],['when', 'next', 'alarm']];
-
-        if (songTriggers.some(triggers => triggers.every(trigger => transcriptionwithoutpunctuation.includes(trigger)))) {
-          currentlythinking = true;
-          playSound(connection, 'understood');
-          // Remove the song triggers from the transcription
-          for (const trigger of songTriggers) {
-            for (const word of trigger) {
-              transcription = transcription.replace(word, '').trim();
-            }
-          }
-          seatchAndPlayYouTube(transcription, userId, connection, channel);
-          restartListening(userId, connection, channel);
-          return;
-        }
-        else if (timerTriggers.some(triggers => triggers.every(trigger => transcriptionwithoutpunctuation.includes(trigger)))) {
-          currentlythinking = true;
-          playSound(connection, 'understood');
-          // Determine if the timer is for an alarm or a timer
-          const timertype = transcription.toLowerCase().includes('alarm') ? 'alarm' : 'timer';
-
-          // Remove the timer triggers from the transcription
-          for (const trigger of timerTriggers) {
-            for (const word of trigger) {
-              transcription = transcription.replace(word, '').trim();
-            }
-          }
-          // Send to timer API
-          setTimer(transcription, timertype, userId, connection, channel);
-          restartListening(userId, connection, channel);
-          return;
-        }
-        else if (cancelTimerTriggers.some(triggers => triggers.every(trigger => transcriptionwithoutpunctuation.includes(trigger)))) {
-          playSound(connection, 'understood');
-          // Remove the cancel timer triggers from the transcription
-          for (const word of cancelTimerTriggers) {
-            transcription = transcription.replace(word, '').trim();
-          }
-
-          // Check for an ID in the transcription, else list the timers with their ID and time
-          const timerId = transcription.match(/\d+/);
-          if(!timerId){
-            const converttable = {
-              'one': 1,
-              'two': 2,
-              'three': 3,
-              'four': 4,
-              'five': 5,
-              'six': 6,
-              'seven': 7,
-              'eight': 8,
-              'nine': 9,
-              'first': 1,
-              'second': 2,
-              'third': 3,
-              'fourth': 4,
-              'fifth': 5,
-              'sixth': 6,
-              'seventh': 7,
-              'eighth': 8,
-              'ninth': 9
-            };
-        
-            const timeValueText = query.match(/one|two|three|four|five|six|seven|eight|nine|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth/g);
-            if (timeValueText) {
-              timerId = [converttable[timeValueText[0]]];
-            }
-          }
-
-          if (timerId) {
-            // Cancel the timer with the given ID
-            cancelTimer(timerId[0], userId, connection, channel);
-          }
-          else {
-            // List the timers
-            if (alarms.length > 1){
-              sendToTTS(`Which one would you like to cancel? You have the following: ${alarms.map((alarm, index) => `${alarm.type} ${index + 1} set for ${alarm.time}`).join(', ')}`, userId, connection, channel);
-            }
-            else if (alarms.length === 1){
-              cancelTimer(1, userId, connection, channel);
-            }
-            else{
-              sendToTTS('There are no timers to cancel.', userId, connection, channel);
-            }
-          }
-
-          restartListening(userId, connection, channel);
-          return;
-        }
-        else if (listTimerTriggers.some(triggers => triggers.every(trigger => transcriptionwithoutpunctuation.includes(trigger)))) {
-          playSound(connection, 'understood');
-          listTimers(userId, connection, channel);
-          restartListening(userId, connection, channel);
-          return;
-        }
-        else if (internetTriggers.some(trigger => transcriptionwithoutpunctuation.includes(trigger))) {
-          // Remove unwanted words from the transcription:
-          // "for" after "search" or "internet"
-          transcription = transcription.replace(/search for/g, 'search');
-          transcription = transcription.replace(/internet for/g, 'internet');
-
-          currentlythinking = true;
-          playSound(connection, 'understood');
-          // Remove the internet triggers from the transcription
-          for (const word of internetTriggers) {
-            transcription = transcription.replace(word, '').trim();
-          }
-          // Send to search API
-          sendToPerplexity(transcription, userId, connection, channel);
-          restartListening(userId, connection, channel);
-          return;
-        }
-
-        currentlythinking = true;
-        playSound(connection, 'understood');
-        sendToLLM(transcription, userId, connection, channel);
-        restartListening(userId, connection, channel);
+    
+    // Check if we should process immediately or wait for more messages
+    const shouldProcessNow = await shouldProcessConversationBuffer();
+    
+    if (shouldProcessNow) {
+      await processConversationBuffer(connection, channel);
     } else {
-        currentlythinking = false;
-        logToConsole('> Bot was not addressed directly. Ignoring the command.', 'info', 2);
-        restartListening(userId, connection, channel);
+      // Set new silence timer
+      conversationBuffer.silenceTimer = setTimeout(() => {
+        processConversationBuffer(connection, channel);
+      }, CONVERSATION_CONFIG.groupSilenceDuration);
     }
+    
+    // Restart listening for this user
+    restartListening(userId, connection, channel);
+    
   } catch (error) {
     currentlythinking = false;
     logToConsole(`X Failed to transcribe audio: ${error.message}`, 'error', 1);
-    // Restart listening after an error
     restartListening(userId, connection, channel);
   } finally {
-    // Ensure files are always deleted regardless of the transcription result
+    // Cleanup files
     try {
       fs.unlinkSync(fileName);
-      const pcmPath = fileName.replace('.mp3', '.pcm');  // Ensure we have the correct .pcm path
+      const pcmPath = fileName.replace('.mp3', '.pcm');
       fs.unlinkSync(pcmPath);
     } catch (cleanupError) {
-      // Log cleanup errors but continue
+      // Silent fail on cleanup
     }
+  }
+}
+
+function estimateTokenCount(text) {
+  return Math.ceil(text.length / 4); // Rough estimate: ~4 chars per token
+}
+
+function logPromptStats(systemPrompt, messages) {
+  const totalTokens = estimateTokenCount(systemPrompt + JSON.stringify(messages));
+  const systemTokens = estimateTokenCount(systemPrompt);
+  
+  logToConsole(`> Prompt stats: System=${systemTokens} tokens, Total=${totalTokens} tokens`, 'info', 2);
+  
+  if (totalTokens > 3000) {
+    logToConsole(`! Large prompt detected: ${totalTokens} tokens`, 'warn', 1);
+  }
+
+  // Save full prompt to file (Uncomment to test system prompt)
+  try {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `./chat_logs/prompt_${timestamp}.txt`;
+    
+    let fullPrompt = `Timestamp: ${new Date().toLocaleString()}\n`;
+    fullPrompt += `System Tokens: ${systemTokens}\n`;
+    fullPrompt += `Total Tokens: ${totalTokens}\n\n`;
+    fullPrompt += '=== FULL PROMPT SENT TO LLM ===\n\n';
+    fullPrompt += systemPrompt;
+    fullPrompt += '=== MESSAGES ===\n\n';
+    fullPrompt += JSON.stringify(messages, null, 2);
+    
+    fs.writeFileSync(filename, fullPrompt);
+    logToConsole(`> Prompt saved to ${filename}`, 'info', 2);
+  } catch (error) {
+    logToConsole(`X Failed to save prompt: ${error.message}`, 'error', 1);
   }
 }
 
@@ -756,27 +1357,108 @@ function getDisplayName(userId, channel) {
   return member?.displayName || member?.user.globalName || member?.user.username || `User ${userId}`;
 }
 
-async function sendToLLM(transcription, userId, connection, channel) {
-  let messages = chatHistory[userId] || [];
+function cleanTranscription(transcription) {
+  // Replace common STT misinterpretations of "Berger" with the correct name
+  const replacements = {
+    // Case-insensitive replacements for "Burger" variations
+    'burger': 'Berger',
+    'Burger': 'Berger',
+    'BURGER': 'Berger',
+    
+    // Add other common STT mishearings of "Berger" if noticed
+    'berger': 'Berger',  
+    
+  };
 
-  // Check if we need to inject context (conversation is short or starting new)
-  const needsContext = messages.length <= 3;
+  let cleaned = transcription;
+  
+  // Replace each word, preserving word boundaries
+  Object.entries(replacements).forEach(([incorrect, correct]) => {
+    // Use word boundaries (\b) to ensure we only replace whole words
+    const regex = new RegExp(`\\b${incorrect}\\b`, 'g');
+    cleaned = cleaned.replace(regex, correct);
+  });
+
+  // Additional cleaning you might want to add:
+  
+  // Fix common STT punctuation issues
+  cleaned = cleaned.replace(/\s+/g, ' '); // Remove extra spaces
+  cleaned = cleaned.trim(); // Remove leading/trailing spaces
+  
+  return cleaned;
+}
+
+// Helper function to replace placeholders in system prompt
+function processSystemPrompt(prompt) {
+  const now = new Date();
+  const timezone = process.env.TIMEZONE || 'America/Phoenix';
+  
+  const dateOptions = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
+  const timeOptions = { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: timezone };
+  
+  const currentDate = now.toLocaleDateString('en-US', dateOptions);
+  const currentTime = now.toLocaleTimeString('en-US', timeOptions);
+  const currentYear = now.getFullYear();
+  
+  // Replace placeholders
+  return prompt
+    .replace(/%DATE%/g, currentDate)
+    .replace(/%TIME%/g, currentTime)
+    .replace(/%YEAR%/g, currentYear)
+    .replace(/%DATETIME%/g, `${currentDate} at ${currentTime}`);
+}
+
+async function sendToLLM(conversationText, primaryUserId, allParticipants, connection, channel) {
+  let messages = chatHistory[primaryUserId] || [];
+  
+  // OPTIMIZATION 1: Smart memory retrieval - only check if keywords are present
+  const conversationLower = conversationText.toLowerCase();
+  const foundKeywords = checkForMemoryKeywords(conversationLower);
+  let relevantMemories = [];
+  
+  if (foundKeywords.length > 0) {
+    logToConsole(`> Found memory keywords: ${foundKeywords.join(', ')}`, 'info', 1);
+    relevantMemories = await findMemoriesByKeywords(primaryUserId, foundKeywords, 3);
+  }
+  
+  // OPTIMIZATION 2: Smart chat log retrieval - only inject if conversation is short or semantic match
+  const needsHistoryContext = messages.length <= 2;
   let contextInjected = false;
-
-  // If this is the first message, add a system prompt
+  
   if (messages.length === 0) {
     let systemPrompt = allowwithouttrigger ? process.env.LLM_SYSTEM_PROMPT_FREE : process.env.LLM_SYSTEM_PROMPT;
-    const displayName = getDisplayName(userId, channel);
-    systemPrompt += `\n\nUser Information: The person you are currently talking to is ${displayName}. When you need to address them by name, use "${displayName}".`;
+    systemPrompt = processSystemPrompt(systemPrompt);
     
-    // If we need context, inject it into the system prompt
-    if (needsContext) {
-      const recentLogs = await getRecentChatLogs(userId, 7, 15); // Now async
+    // Build participant list
+    const participantNames = Array.from(allParticipants)
+      .map(id => getDisplayName(id, channel))
+      .join(', ');
+    
+    systemPrompt += `\n\n=== USER INFORMATION ===\n`;
+    if (allParticipants.size > 1) {
+      systemPrompt += `You are currently in a conversation with multiple people: ${participantNames}.\n`;
+      systemPrompt += `The conversation may have multiple speakers. Pay attention to who is saying what.\n\n`;
+    } else {
+      systemPrompt += `You are currently talking to ${participantNames}.\n\n`;
+    }
+    
+    // Add memory system instructions
+    systemPrompt += getMemorySystemPrompt();
+    
+    // Add relevant memories if found
+    if (relevantMemories.length > 0) {
+      systemPrompt += '\n' + formatMemoriesForContext(relevantMemories);
+      logToConsole(`> Injected ${relevantMemories.length} relevant memories`, 'info', 1);
+    }
+    
+    // OPTIMIZATION 3: Only inject chat history if needed
+    if (needsHistoryContext) {
+      const recentLogs = await getRecentChatLogs(primaryUserId, 7, 5); // Reduced from 8 to 5
       if (recentLogs.length > 0) {
         const formattedLogs = formatChatLogsForContext(recentLogs);
-        systemPrompt += '\n\n--- Previous Conversation Context ---\n' + formattedLogs + '\n--- End Context ---';
+        systemPrompt += formattedLogs;
         contextInjected = true;
-        logToConsole('> Injected context into system prompt', 'info', 2);
+        logToConsole('> Injected chat history context', 'info', 2);
       }
     }
     
@@ -784,31 +1466,32 @@ async function sendToLLM(transcription, userId, connection, channel) {
       role: 'system',
       content: systemPrompt
     });
-  } else if (needsContext && !contextInjected) {
-    // Inject context as a system message if conversation is short but not first message
-    const recentLogs = await getRecentChatLogs(userId, 7, 15); // Now async
-    if (recentLogs.length > 0) {
-      const formattedLogs = formatChatLogsForContext(recentLogs);
+    
+    logPromptStats(systemPrompt, messages);
+  } else {
+    // For ongoing conversations, only add memories if found
+    if (relevantMemories.length > 0) {
       messages.push({
         role: 'system',
-        content: '--- Relevant Previous Conversation Context ---\n' + formattedLogs + '\n--- End Context ---'
+        content: `=== MEMORIES RECALLED ===\n${formatMemoriesForContext(relevantMemories)}`
       });
-      contextInjected = true;
-      logToConsole('> Injected context into conversation', 'info', 2);
+      logToConsole(`> Injected ${relevantMemories.length} memories into ongoing conversation`, 'info', 1);
     }
   }
   
-  // Add the user's message to the chat history
+  // Add the user's message(s) to chat history
   messages.push({
     role: 'user',
-    content: transcription
+    content: conversationText
   });
 
-  // Keep only the latest X messages (but account for potential context injection)
-  const messageCount = messages.length;
-  const maxSize = contextInjected ? process.env.MEMORY_SIZE + 1 : process.env.MEMORY_SIZE;
-  if (messageCount > maxSize) {
-    messages = messages.slice(messageCount - maxSize);
+  // OPTIMIZATION 4: Dynamic memory size based on context
+  const effectiveMemorySize = (contextInjected || relevantMemories.length > 0) 
+    ? parseInt(process.env.MEMORY_SIZE) + 2 
+    : parseInt(process.env.MEMORY_SIZE);
+    
+  if (messages.length > effectiveMemorySize) {
+    messages = messages.slice(messages.length - effectiveMemorySize);
   }
 
   try {
@@ -820,360 +1503,119 @@ async function sendToLLM(transcription, userId, connection, channel) {
       }
     });
     
-    // Single API call - no more double querying
-    client.post('/chat/completions', {
+    const toolsEnabled = process.env.ENABLE_TOOLS !== "false";
+    
+    let requestBody = {
       model: process.env.LLM,
       messages: messages,
-    })
-    .then(async (response) => {
-      let llmresponse = response.data.choices[0].message.content;
-      logToConsole(`> LLM Response: ${llmresponse}`, 'info', 1);
+      stream: false
+    };
 
-      if(llmresponse.includes("IGNORING")){
-        currentlythinking = false;
-        logToConsole('> LLM Ignored the command.', 'info', 2);
-        return;
-      }
+    if (toolsEnabled) {
+      requestBody.tools = AVAILABLE_TOOLS;
+      requestBody.tool_choice = "auto";
+    }
 
-      // Store the LLM's response in the history
-      messages.push({
-        role: 'assistant',
-        content: llmresponse
-      });
+    // Tool calling loop (unchanged)
+    let maxIterations = 5;
+    let iteration = 0;
+    let finalResponse = null;
+    
+    while (iteration < maxIterations) {
+      iteration++;
+      logToConsole(`> Sending LLM request (attempt ${iteration}/${maxIterations})`, 'info', 2);
       
-      // Update the chat history
-      chatHistory[userId] = messages;
-
-      // Save to chat log (now async)
-      await saveChatLog(userId, transcription, llmresponse, channel);
-
-      // Update the transcription file if transcribe mode is enabled
-      if (transcribemode) {
-        if (!fs.existsSync('./transcription.txt')) {
-          fs.writeFileSync('./transcription.txt', '');
+      const response = await client.post('/chat/completions', requestBody);
+      const choice = response.data.choices[0];
+      const responseMessage = choice.message;
+      
+      if (toolsEnabled && responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
+        logToConsole(`✓ LLM wants to use ${responseMessage.tool_calls.length} tool(s)!`, 'info', 1);
+        
+        messages.push({
+          role: 'assistant',
+          content: responseMessage.content || null,
+          tool_calls: responseMessage.tool_calls
+        });
+        
+        for (const toolCall of responseMessage.tool_calls) {
+          const toolName = toolCall.function.name;
+          const toolArgs = toolCall.function.arguments;
+          
+          logToConsole(`> Calling tool: ${toolName}`, 'info', 1);
+          const toolResult = await executeTool(toolName, toolArgs);
+          
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            name: toolName,
+            content: toolResult
+          });
+          
+          logToConsole(`✓ Tool completed: ${toolResult.substring(0, 100)}${toolResult.length > 100 ? '...' : ''}`, 'info', 1);
         }
-        fs.appendFileSync('./transcription.txt', `${userId}: ${transcription}\n\nAssistant: ${llmresponse}\n\n`);
+        
+        requestBody.messages = messages;
+      } else {
+        finalResponse = responseMessage.content;
+        logToConsole(`> LLM final response received (${finalResponse.length} chars)`, 'info', 2);
+        break;
       }
-
-      // Send response to TTS service
-      playSound(connection, 'result');
-      sendToTTS(cleanLLMResponse(llmresponse), userId, connection, channel);
-    })
-    .catch((error) => {
+    }
+    
+    if (iteration >= maxIterations) {
+      logToConsole('! Maximum tool iterations reached', 'warn', 1);
       currentlythinking = false;
-      logToConsole(`X Failed to communicate with LLM: ${error.message}`, 'error', 1);
-    });
-  } catch (error) {
-    currentlythinking = false;
-    logToConsole(`X Failed to communicate with LLM: ${error.message}`, 'error', 1);
-  }
-}
-
-async function sendTextToLLM(message) {
-  let messages = [];
-
-  // Fetch the message chain first
-  let currentMessage = message;
-  const messageChain = [];
-
-  while (currentMessage) {
-    messageChain.push({
-      role: currentMessage.author.id === client.user.id ? 'assistant' : 'user',
-      content: currentMessage.content
-    });
-    if (currentMessage.reference) {
-      try {
-        currentMessage = await message.channel.messages.fetch(currentMessage.reference.messageId);
-      } catch (error) {
-        if (error.code === 10008) {
-          console.error(`Failed to fetch message: ${error.message}`);
-          break;
-        } else {
-          throw error;
-        }
-      }
-    } else {
-      currentMessage = null;
+      return;
     }
-  }
-
-  messageChain.reverse();
-  messages.push(...messageChain);
-
-  // Check if we need context injection (short conversation chain)
-  const needsContext = messages.length <= 3;
-  let systemPrompt = process.env.LLM_TEXT_SYSTEM_PROMPT;
-
-  if (needsContext) {
-    const recentLogs = await getRecentChatLogs(message.author.id, 7, 15); // Now async
-    if (recentLogs.length > 0) {
-      const formattedLogs = formatChatLogsForContext(recentLogs);
-      systemPrompt += '\n\n--- Previous Conversation Context ---\n' + formattedLogs + '\n--- End Context ---';
-      logToConsole('> Injected context into text conversation', 'info', 2);
+    
+    if (!finalResponse) {
+      logToConsole('X No response content from LLM', 'error', 1);
+      currentlythinking = false;
+      return;
     }
-  }
 
-  // Define the system message with potential context
-  const systemMessage = {
-    role: 'system',
-    content: systemPrompt
-  };
+    logToConsole(`> LLM Response: ${finalResponse}`, 'info', 1);
 
-  // Keep only the latest X messages, excluding the system message in the count
-  const messageCount = messages.length;
-  if (messageCount >= process.env.MEMORY_SIZE) {
-    messages = messages.slice(-(process.env.MEMORY_SIZE - 1));
-  }
+    if (finalResponse.includes("[IGNORING]")) {
+      currentlythinking = false;
+      logToConsole('> LLM Ignored the command.', 'info', 2);
+      return;
+    }
 
-  // Add the system message at the beginning
-  messages.unshift(systemMessage);
+    // Parse memories and clean response
+    const cleanedResponse = await parseMemoryTags(finalResponse, primaryUserId);
+    const fullyCleaned = cleanLLMResponse(cleanedResponse);
 
-  try {
-    const client = axios.create({
-      baseURL: process.env.LLM_ENDPOINT,
-      headers: {
-        'Authorization': `Bearer ${process.env.LLM_API}`,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    // Single API call
-    const response = await client.post('/chat/completions', {
-      model: process.env.LLM,
-      messages: messages,
-    });
-
-    const llmresponse = response.data.choices[0].message.content;
-    logToConsole(`> LLM Text Response: ${llmresponse}`, 'info', 1);
-
-    return llmresponse;
-  } catch (error) {
-    console.error(`Failed to communicate with LLM: ${error.message}`);
-    return 'Sorry, I am having trouble processing your request right now.';
-  }
-}
-
-async function sendToLLMInThread(message, threadId) {
-  // Initialize thread memory if it doesn't exist
-  if (!threadMemory[threadId]) {
-    threadMemory[threadId] = [];
-
-    const threadMessages = await message.channel.messages.fetch({ limit: 20 });
-    threadMessages.forEach(threadMessage => {
-      threadMemory[threadId].push({
-        role: threadMessage.author.id === client.user.id ? 'assistant' : 'user',
-        content: threadMessage.content
-      });
-    });
-
-    threadMemory[threadId].reverse();
-    threadMemory[threadId].shift();
-    threadMemory[threadId].shift();
-  }
-
-  let messages = threadMemory[threadId];
-
-  // Fetch the original message of the thread
-  const threadParentMessage = await message.channel.fetchStarterMessage();
-  if (threadParentMessage) {
     messages.push({
-      role: threadParentMessage.author.id === client.user.id ? 'assistant' : 'user',
-      content: threadParentMessage.content
-    });
-  }
-
-  // Add the current message
-  messages.push({
-    role: message.author.id === client.user.id ? 'assistant' : 'user',
-    content: message.content
-  });
-
-  // Check if we need context injection for threads
-  const needsContext = messages.length <= 3;
-  let systemPrompt = process.env.LLM_TEXT_SYSTEM_PROMPT;
-
-  if (needsContext) {
-    const recentLogs = await getRecentChatLogs(message.author.id, 7, 15); // Now async
-    if (recentLogs.length > 0) {
-      const formattedLogs = formatChatLogsForContext(recentLogs);
-      systemPrompt += '\n\n--- Previous Conversation Context ---\n' + formattedLogs + '\n--- End Context ---';
-      logToConsole('> Injected context into thread conversation', 'info', 2);
-    }
-  }
-
-  // Keep only the latest X messages
-  const messageCount = messages.length;
-  if (messageCount >= process.env.MEMORY_SIZE) {
-    messages = messages.slice(-(process.env.MEMORY_SIZE - 1));
-  }
-
-  // Update thread memory
-  threadMemory[threadId] = messages;
-
-  // Add system message
-  const systemMessage = {
-    role: 'system',
-    content: systemPrompt
-  };
-  messages.unshift(systemMessage);
-
-  try {
-    const client = axios.create({
-      baseURL: process.env.LLM_ENDPOINT,
-      headers: {
-        'Authorization': `Bearer ${process.env.LLM_API}`,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    // Single API call
-    const response = await client.post('/chat/completions', {
-      model: process.env.LLM,
-      messages: messages,
-    });
-
-    const llmresponse = response.data.choices[0].message.content;
-
-    // Add LLM response to thread memory
-    threadMemory[threadId].push({
       role: 'assistant',
-      content: llmresponse
-    });
-
-    logToConsole(`> LLM Thread Response: ${llmresponse}`, 'info', 1);
-    return llmresponse;
-  } catch (error) {
-    console.error(`Failed to communicate with LLM: ${error.message}`);
-    return 'Sorry, I am having trouble processing your request right now.';
-  }
-}
-
-async function sendToPerplexity(transcription, userId, connection, channel) {
-  let messages = chatHistory[userId] || [];
-
-  // Return error if perplexity key is missing
-  if(process.env.PERPLEXITY_API === undefined || process.env.PERPLEXITY_API === "" || process.env.PERPLEXITY_MODEL === "MY_PERPLEXITY_API_KEY"){
-    logToConsole('X Perplexity API key is missing', 'error', 1);
-    sendToTTS('Sorry, I do not have access to internet. You may add a Perplexity API key to add this feature.', userId, connection, channel);
-    return;
-  }
-
-  // Refuse if perplexity is not allowed
-  if(process.env.PERPLEXITY === "false"){
-    logToConsole('X Perplexity is not allowed', 'error', 1);
-    sendToTTS('Sorry, I am not allowed to search the internet.', userId, connection, channel);
-    return;
-  }
-
-  // System prompt not allowed on Perplexity search
-  
-  // Add the user's message to the chat history
-  messages.push({
-    role: 'user',
-    content: transcription
-  });
-
-  // Keep only the latest X messages
-  const messageCount = messages.length;
-  if (messageCount > process.env.MEMORY_SIZE) {
-    messages = messages.slice(messageCount - process.env.MEMORY_SIZE);
-  }
-
-  try {
-    const client = axios.create({
-      baseURL: process.env.PERPLEXITY_ENDPOINT,
-      headers: {
-        'Authorization': `Bearer ${process.env.PERPLEXITY_API}`,
-        'Content-Type': 'application/json'
-      }
+      content: fullyCleaned
     });
     
-    // Chat completion without streaming
-    client.post('/chat/completions', {
-      model: process.env.PERPLEXITY_MODEL,
-      messages: messages,
-    })
-    .then((response) => {
-      const llmresponse = response.data.choices[0].message.content;
-      logToConsole(`> LLM Response: ${llmresponse}`, 'info', 1);
+    chatHistory[primaryUserId] = messages;
 
-      if(llmresponse.includes("IGNORING")){
-        currentlythinking = false;
-        logToConsole('> LLM Ignored the command.', 'info', 2);
-        return;
+    // Save to chat log
+    await saveChatLog(primaryUserId, conversationText, fullyCleaned, channel);
+
+    // Update transcription file if needed
+    if (transcribemode) {
+      if (!fs.existsSync('./transcription.txt')) {
+        fs.writeFileSync('./transcription.txt', '');
       }
+      fs.appendFileSync('./transcription.txt', `${conversationText}\n\nAssistant: ${fullyCleaned}\n\n`);
+    }
 
-      // Store the LLM's response in the history
-      messages.push({
-        role: 'assistant',
-        content: llmresponse
-      });
-      
-      // Update the chat history
-      chatHistory[userId] = messages;
-
-      // Save to chat log for Perplexity responses too
-      saveChatLog(userId, transcription, llmresponse, channel);
-
-      // Send response to TTS service
-      playSound(connection, 'result');
-      sendToTTS(cleanLLMResponse(llmresponse), userId, connection, channel);
-    })
-    .catch((error) => {
-      currentlythinking = false;
-      logToConsole(`X Failed to communicate with LLM: ${error.message}`, 'error', 1);
-    });
+    // Send to TTS
+    sendToTTS(fullyCleaned, primaryUserId, connection, channel);
+    
   } catch (error) {
     currentlythinking = false;
     logToConsole(`X Failed to communicate with LLM: ${error.message}`, 'error', 1);
-  }
-}
-
-async function sendTextToPerplexity(transcription) {
-  let messages = [];
-
-  // Return error if perplexity key is missing
-  if (process.env.PERPLEXITY_API === undefined || process.env.PERPLEXITY_API === "" || process.env.PERPLEXITY_MODEL === "MY_PERPLEXITY_API_KEY") {
-    logToConsole('X Perplexity API key is missing', 'error', 1);
-    return "Sorry, I do not have access to internet. You may add a Perplexity API key to add this feature.";
-  }
-
-  // Refuse if perplexity is not allowed
-  if (process.env.PERPLEXITY === "false") {
-    logToConsole('X Perplexity is not allowed', 'error', 1);
-    return "Sorry, I am not allowed to search the internet.";
-  }
-
-  // Add the user's message to the chat history
-  messages.push({
-    role: 'user',
-    content: transcription
-  });
-
-  try {
-    const client = axios.create({
-      baseURL: process.env.PERPLEXITY_ENDPOINT,
-      headers: {
-        'Authorization': `Bearer ${process.env.PERPLEXITY_API}`,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    // Chat completion without streaming
-    const response = await client.post('/chat/completions', {
-      model: process.env.PERPLEXITY_MODEL,
-      messages: messages,
-    });
-
-    const llmresponse = response.data.choices[0].message.content;
-    logToConsole(`> LLM Response: ${llmresponse}`, 'info', 1);
-
-    currentlythinking = false;
-    return llmresponse;
-  } catch (error) {
-    currentlythinking = false;
-    logToConsole(`X Failed to communicate with LLM: ${error.message}`, 'error', 1);
-    return "Sorry, I am having trouble processing your request right now.";
+    
+    if (error.response) {
+      logToConsole(`X HTTP Status: ${error.response.status}`, 'error', 1);
+      logToConsole(`X Response data: ${JSON.stringify(error.response.data).substring(0, 500)}`, 'error', 1);
+    }
   }
 }
 
@@ -1210,7 +1652,7 @@ async function sendToTTS(text, userid, connection, channel) {
   for (const chunk of chunks) {
     try {
       if(process.env.TTS_TYPE === "speecht5"){
-        logToConsole('> Using SpeechT5 TTS', 'info', 2);
+        logToConsole('> Using Norman TTS', 'info', 2);
         const response = await axios.post(process.env.TTS_ENDPOINT + '/synthesize', {
           text: chunk,
         }, {
@@ -1223,16 +1665,13 @@ async function sendToTTS(text, userid, connection, channel) {
         const filename = `./sounds/tts_${chunks.indexOf(chunk)}.wav`;
         fs.writeFileSync(filename, audioBuffer);
 
-        if(process.env.RVC === "true"){
-          sendToRVC(filename, userid, connection, channel);
-        }
-        else{
+        
           audioqueue.push({ file: filename, index: chunks.indexOf(chunk) });
 
           if (audioqueue.length === 1) {
             playAudioQueue(connection, channel, userid);
           }
-        }
+        
       }
       else{
         logToConsole('> Using OpenAI TTS', 'info', 2);
@@ -1253,84 +1692,19 @@ async function sendToTTS(text, userid, connection, channel) {
         const filename = `./sounds/tts_${chunks.indexOf(chunk)}.mp3`;
         fs.writeFileSync(filename, audioBuffer);
 
-        if(process.env.RVC === "true"){
-          sendToRVC(filename, userid, connection, channel);
-        }
-        else{
+        
           audioqueue.push({ file: filename, index: chunks.indexOf(chunk) });
 
           if (audioqueue.length === 1) {
             logToConsole('> Playing audio queue', 'info', 2);
             playAudioQueue(connection, channel, userid);
           }
-        }
+        
       }
     } catch (error) {
       currentlythinking = false;
       logToConsole(`X Failed to send text to TTS: ${error.message}`, 'error', 1);
     }
-  }
-}
-
-async function sendToRVC(file, userid, connection, channel) {
-  try {
-    logToConsole('> Sending TTS to RVC', 'info', 2);
-
-    let mp3name = file.replace('tts', 'rvc');
-    mp3name = mp3name.replace('mp3', 'wav');
-    let mp3index = mp3name.split('_')[1].split('.')[0];
-    mp3index = parseInt(mp3index);
-
-    // Create an instance of FormData
-    const formData = new FormData();
-
-    // Append the file to the form data. Here 'input_file' is the key name used in the form
-    formData.append('input_file', fs.createReadStream(file), {
-      filename: file,
-      contentType: 'audio/mpeg'
-    });
-
-    // Configure the Axios request
-    const config = {
-      method: 'post',
-      url: process.env.RVC_ENDPOINT+'/voice2voice?model_name='+process.env.RVC_MODEL+'&index_path='+process.env.RVC_MODEL+'&f0up_key='+process.env.RVC_F0+'&f0method=rmvpe&index_rate='+process.env.RVC_INDEX_RATE+'&is_half=false&filter_radius=3&resample_sr=0&rms_mix_rate=1&protect='+process.env.RVC_PROTECT,
-      headers: { 
-        ...formData.getHeaders(), // Spread the headers from formData to ensure correct boundary is set
-        'accept': 'application/json'
-      },
-      responseType: 'stream', // This ensures that Axios handles the response as a stream
-      data: formData
-    };
-
-    // Send the request using Axios
-    axios(config)
-    .then(function (response) {
-      // Handle the stream response to save it as a file
-      const writer = fs.createWriteStream(mp3name);
-      response.data.pipe(writer);
-
-      return new Promise((resolve, reject) => {
-        writer.on('finish', resolve);
-        writer.on('error', reject);
-      });
-    })
-    .then(() => {
-      // Delete original tts file
-      fs.unlinkSync(file);
-
-      audioqueue.push({ file: mp3name, index: mp3index });
-
-      if (audioqueue.length === 1) {
-        logToConsole('> Playing audio queue', 'info', 2);
-        playAudioQueue(connection, channel, userid);
-      }
-    })
-    .catch(function (error) {
-      logToConsole(`X Failed to send tts to RVC: ${error.message}`, 'error', 1);
-    });
-  } catch (error) {
-    currentlythinking = false;
-    logToConsole(`X Failed to send tts to RVC: ${error.message}`, 'error', 1);
   }
 }
 
@@ -1399,80 +1773,8 @@ async function playAudioQueue(connection, channel, userid) {
   }
 }
 
-async function playSound(connection, sound, volume = 1) {
-  // Check if allowwithouttrigger is true, if yes ignore
-  if ((allowwithouttrigger || allowwithoutbip) && sound !== 'command') {
-    return;
-  }
-
-  // Check if the sound file exists
-  if (!fs.existsSync(`./sounds/${sound}.mp3`)) {
-    logToConsole(`X Sound file not found: ${sound}.mp3`, 'error', 1);
-    return;
-  }
-
-  // Create a stream from the sound file using ffmpeg
-  const stream = fs.createReadStream(`./sounds/${sound}.mp3`);
-  const ffmpegStream = ffmpeg(stream)
-    .audioFilters(`volume=${volume}`)
-    .format('opus')
-    .on('error', (err) => console.error(err))
-    .stream();
-
-  // Create an audio resource from the ffmpeg stream
-  const resource = createAudioResource(ffmpegStream);
-  const player = createAudioPlayer();
-
-  // Subscribe the connection to the player and play the resource
-  player.play(resource);
-  connection.subscribe(player);
-
-  player.on('error', error => logToConsole(`Error: ${error.message}`, 'error', 1));
-  player.on('stateChange', (oldState, newState) => {
-    if (newState.status === 'idle') {
-      alarmongoing = false;
-      logToConsole('> Finished playing sound.', 'info', 2);
-    }
-  });
-}
-
 function restartListening(userID, connection, channel) {
   handleRecordingForUser(userID, connection, channel);
-}
-
-async function seatchAndPlayYouTube(songName, userid, connection, channel) {
-  // Check if songName is actually a YouTube URL
-  let videoUrl = songName;
-  if (!songName.includes('youtube.com')){
-    videoUrl = await searchYouTube(songName);
-  }
-
-  if (!videoUrl) {
-      // If no video was found, voice it out
-      sendToTTS('Sorry, I could not find the requested song.', userid, connection, channel);
-  }
-
-  logToConsole(`> Playing YouTube video: ${videoUrl}`, 'info', 1);
-
-  const stream = ytdl(videoUrl, { filter: 'audioonly', quality: 'highestaudio' });
-  const ffmpegStream = ffmpeg(stream)
-      .audioFilters(`volume=0.05`)
-      .format('opus')
-      .on('error', (err) => console.error(err))
-      .stream();
-
-  const resource = createAudioResource(ffmpegStream);
-  const player = createAudioPlayer();
-
-  player.play(resource);
-  connection.subscribe(player);
-
-  player.on('stateChange', (oldState, newState) => {
-      if (newState.status === 'idle') {
-        currentlythinking = false;
-        logToConsole('> Finished playing YouTube.', 'info', 1);
-      }
-  });
 }
 
 function logToConsole(message, level, type) {
@@ -1493,122 +1795,6 @@ function logToConsole(message, level, type) {
   }
 }
 
-async function searchYouTube(query) {
-  if(process.env.YOUTUBE_API === undefined || process.env.YOUTUBE_API === "" || process.env.YOUTUBE_API === "MY_YOUTUBE_API_KEY"){
-    logToConsole('X YouTube API key is missing', 'error', 1);
-    sendToTTS('Sorry, I do not have access to YouTube. You may add a YouTube API key to add this feature.', userid, connection, channel);
-    return null;
-  }
-
-  // Try removing unwanted words from the query:
-  // If it starts with Hey and have a comma, remove everything before the comma and the comma
-  // if it ends with "on" or "in", remove the last word
-  const unwantedWords = ['hey', 'on', 'in'];
-  const queryWords = query.split(' ');
-  if (queryWords[0].toLowerCase() === 'hey' && query.includes(',')) {
-    query = query.split(',').slice(1).join(',');
-  }
-  if (unwantedWords.includes(queryWords[queryWords.length - 1].toLowerCase())) {
-    query = query.split(' ').slice(0, -1).join(' ');
-  }
-
-  logToConsole(`> Searching YouTube for: ${query}`, 'info', 1);
-
-  try {
-    // First, search for videos
-    const searchRes = await youtube.search.list({
-        part: 'snippet',
-        q: query,
-        maxResults: 5,
-        type: 'video'
-    });
-
-    const videoIds = searchRes.data.items.map(item => item.id.videoId).join(',');
-
-    // Then, get details of these videos
-    const detailsRes = await youtube.videos.list({
-        part: 'snippet,contentDetails,statistics',
-        id: videoIds,
-        key: process.env.YOUTUBE_API_KEY
-    });
-
-    // Filter and sort videos by duration and view count
-    const validVideos = detailsRes.data.items.filter(video => {
-        const duration = video.contentDetails.duration;
-        return convertDuration(duration) >= 30;
-    });
-
-    if (!validVideos.length) return null;
-    return `https://www.youtube.com/watch?v=${validVideos[0].id}`;
-  } catch (error) {
-      console.error('Failed to fetch YouTube data:', error);
-      return null;
-  }
-}
-
-function convertDuration(duration) {
-  let totalSeconds = 0;
-  const matches = duration.match(/(\d+)(?=[MHS])/ig) || [];
-
-  const parts = matches.map((part, i) => {
-      if (i === 0) return parseInt(part) * 3600;
-      else if (i === 1) return parseInt(part) * 60;
-      else return parseInt(part);
-  });
-
-  if (parts.length > 0) {
-      totalSeconds = parts.reduce((a, b) => a + b);
-  }
-  return totalSeconds;
-}
-
-async function setTimer(query, type = 'alarm', userid, connection, channel) {
-  // Check for known time units (minutes, seconds, hours) with a number
-  const timeUnits = ['minutes', 'minute', 'seconds', 'second', 'hours', 'hour'];
-  const timeUnit = timeUnits.find(unit => query.includes(unit));
-  let timeValue = query.match(/\d+/);
-
-  if (timeUnit && !timeValue) {
-    // Time value is maybe in text form. Try to convert it to a number
-    const converttable = {
-      'one': 1,
-      'two': 2,
-      'three': 3,
-      'four': 4,
-      'five': 5,
-      'six': 6,
-      'seven': 7,
-      'eight': 8,
-      'nine': 9
-    };
-
-    const timeValueText = query.match(/\b(one|two|three|four|five|six|seven|eight|nine)\b/);
-    if (timeValueText) {
-      timeValue = [converttable[timeValueText[0]]];
-    }
-  }
-
-  if (!timeUnit || !timeValue) {
-    sendToTTS('Sorry, I could not understand the requested timer.', userid, connection, channel);
-    return;
-  }
-
-  const time = parseInt(timeValue[0]);
-  const ms = timeUnit.includes('minute') ? time * 60000 : timeUnit.includes('second') ? time * 1000 : time * 3600000;
-  const endTime = new Date(Date.now() + ms);
-  const formattedTime = endTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: 'numeric', hour12: true });
-
-  sendToTTS(`${type} set for ${time} ${timeUnit}`, userid, connection, channel);
-  logToConsole(`> ${type} set for ${time} ${timeUnit}`, 'info', 1);
-
-  const timeoutId = setTimeout(() => {
-    alarmongoing = true;
-    playSound(connection, type, process.env.ALARM_VOLUME);
-    logToConsole('> Timer finished.', 'info', 1);
-  }, ms);
-  alarms.push({ id: timeoutId, time: formattedTime, type: type });
-}
-
 function cleanLLMResponse(text) {
   // Remove <think>...</think> tags and their content
   let cleaned = text.replace(/<think>.*?<\/think>/gs, '');
@@ -1616,127 +1802,17 @@ function cleanLLMResponse(text) {
   // Remove any other common reasoning tags if needed
   cleaned = cleaned.replace(/<reasoning>.*?<\/reasoning>/gs, '');
   cleaned = cleaned.replace(/<analysis>.*?<\/analysis>/gs, '');
-  
+  cleaned = cleaned.replace(/<memories>.*?<\/memories>/gs, '');
+
+  // Remove markdown bold (**text**) and italic (*text*)
+  // This preserves the text but removes the asterisks
+  cleaned = cleaned.replace(/\*\*([^*]+)\*\*/g, '$1');  // Remove **bold**
+  cleaned = cleaned.replace(/\*([^*]+)\*/g, '$1');      // Remove *italic*
+
   // Clean up extra whitespace and newlines
   cleaned = cleaned.replace(/\s+/g, ' ').trim();
   
   return cleaned;
-}
-
-function cancelTimer(alarmIndex, userid, connection, channel) {
-  const index = (parseInt(alarmIndex) - 1);
-  if (index < alarms.length) {
-    clearTimeout(alarms[index].id);
-    logToConsole(`> ${alarms[index].type} for ${alarms[index].time} cancelled`, 'info', 1);
-    sendToTTS(`${alarms[index].type} for ${alarms[index].time} cancelled.`, userid, connection, channel);
-    // Remove the alarm from the list, reindexing the array
-    alarms = alarms.filter((alarm, i) => i !== index);
-  }
-  else{
-    logToConsole(`X Timer index not found: ${index}`, 'error', 1);
-    sendToTTS(`I could not find a ${alarms[index].type} for this time.`, userid, connection, channel);
-  }
-}
-
-function listTimers(userid, connection, channel) {
-  if (alarms.length > 1){
-    sendToTTS(`You have the following: ${alarms.map((alarm, index) => `${alarm.type} ${index + 1} set for ${alarm.time}`).join(', ')}`, userid, connection, channel);
-  }
-  else if (alarms.length === 1){
-    sendToTTS(`You have a ${alarms[0].type} set for ${alarms[0].time}.`, userid, connection, channel);
-  }
-  else{
-    sendToTTS('There are no timers set.', userid, connection, channel);
-  }
-}
-
-async function captionImage(imageUrl, userId, connection, channel) {
-  if (process.env.HUGGING_FACE_API === undefined || process.env.HUGGING_FACE_API === "" || process.env.HUGGING_FACE_API === 'MY_HUGGING_FACE_API_KEY') {
-    logToConsole('X Hugging Face API key is missing', 'error', 1);
-    sendToTTS('Sorry, I do not have access to vision. You may add a Hugging Face API key to add this feature.', userId, connection, channel);
-    return;
-  }
-
-  const headers = {
-      'Authorization': `Bearer ${process.env.HUGGING_FACE_API}`
-  };
-
-  try {
-      const response = await axios.post(process.env.VISION_ENDPOINT + '/' + process.env.VISION_MODEL, {
-          inputs: {
-              url: imageUrl, // Some models might require a different format
-          },
-      }, { headers: headers });
-
-      const caption = response.data[0].generated_text;
-      currentlythinking = true;
-      logToConsole(`> Image caption: ${caption}`, 'info', 1);
-
-      // Send the caption to the LLM
-      sendToLLM("*the user sent the following image in a text channel*: " + caption, userId, connection, channel);
-  } catch (error) {
-      logToConsole(`X Failed to caption image: ${error.message}`, 'error', 1);
-      sendToTTS('Sorry, I cannot see the image.', userId, connection, channel);
-  }
-}
-
-function splitMessage(message, limit = 2000) {
-  const parts = [];
-  let currentPart = "";
-
-  // Split the message by spaces to avoid breaking words
-  const words = message.split(' ');
-
-  words.forEach(word => {
-    if (currentPart.length + word.length + 1 > limit) {
-      // When adding the next word exceeds the limit, push the current part to the array
-      parts.push(currentPart);
-      currentPart = "";
-    }
-    // Add the word to the current part
-    currentPart += (currentPart.length > 0 ? " " : "") + word;
-  });
-
-  // Push the last part
-  if (currentPart.length > 0) {
-    parts.push(currentPart);
-  }
-
-  return parts;
-}
-
-async function isThreadFromBot(message) {
-  if (!message.channel.isThread()) return false;
-
-  const threadParentMessage = await message.channel.fetchStarterMessage();
-  if (!threadParentMessage) return false;
-
-  return threadParentMessage.author.id === client.user.id;
-}
-
-async function scheduleReminder(timestamp, message, userId) {
-  // Calculate delay in ms between the current time and the reminder time
-  const currentTime = Date.now();
-  const reminderTime = timestamp * 1000; // Convert Unix timestamp (seconds) to JavaScript timestamp (milliseconds)
-  const delay = reminderTime - currentTime;
-
-  if (delay <= 0) {
-    client.users.fetch(userId)
-      .then(user => user.send(`⏰ You set a reminder in the past, sorry I cannot time travel yet!`))
-      .catch(error => console.error(`Failed to send reminder: ${error.message}`));
-    return;
-  }
-
-  // Set a timeout to send the reminder message
-  const timeoutId = setTimeout(() => {
-    // Send the reminder message in DM
-    client.users.fetch(userId)
-      .then(user => user.send(`⏰ Reminder: ${message}`))
-      .catch(error => console.error(`Failed to send reminder: ${error.message}`));
-  }, delay);
-
-  // Optionally, store the timeoutId if you need to clear it later
-  return timeoutId;
 }
 
 client.login(TOKEN);
